@@ -1,0 +1,35 @@
+# Flutter
+my_dear_watson/build/
+my_dear_watson/.dart_tool/
+my_dear_watson/.idea/
+my_dear_watson/*.iml
+my_dear_watson/android/.gradle/
+my_dear_watson/android/app/build/
+my_dear_watson/android/local.properties
+my_dear_watson/pubspec.lock
+
+# Rust
+server/target/
+
+# Python
+server/ocr/.venv/
+server/ocr/__pycache__/
+__pycache__/
+*.pyc
+
+# Server runtime files
+server/quire_server.log
+server/quire_ocr.log
+server/quire_debug.log
+server/quire_render_debug.png
+server/quire_screenshots/
+server/quire_dumps/
+
+# OCR dataset (user-specific handwriting)
+ocr_dataset/
+ocr_benchmark/benchmark_results.json
+ocr_benchmark/benchmark2_results.json
+ocr_benchmark/benchmark3_results.json
+
+# OS
+.DS_Store

@@ -1,0 +1,4 @@
+transformers>=5.0.0
+torch>=2.0.0
+Pillow
+pypdfium2
