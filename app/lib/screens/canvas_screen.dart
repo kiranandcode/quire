@@ -555,12 +555,14 @@ class _CanvasScreenState extends State<CanvasScreen> {
             }); },
           ),
           const SizedBox(width: 12),
-          if (SettingsService().debugMode)
-            IconButton(
+          Builder(builder: (context) {
+            if (!SettingsService().debugMode) return const SizedBox.shrink();
+            return IconButton(
               icon: const Icon(Icons.camera_alt_outlined, size: 26),
               tooltip: 'Screenshot',
               onPressed: _takeScreenshot,
-            ),
+            );
+          }),
           IconButton(
             icon: const Icon(Icons.undo_rounded, size: 26),
             onPressed: _undo,
@@ -571,9 +573,12 @@ class _CanvasScreenState extends State<CanvasScreen> {
           ),
           IconButton(
             icon: const Icon(Icons.settings_outlined, size: 26),
-            onPressed: () => Navigator.of(context).push(
-              MaterialPageRoute(builder: (_) => const SettingsScreen()),
-            ),
+            onPressed: () async {
+              await Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const SettingsScreen()),
+              );
+              setState(() {}); // rebuild to pick up changed settings
+            },
           ),
           const SizedBox(width: 4),
         ],

@@ -2,6 +2,8 @@
 
 E-ink AI interface for Boox Go 10.3 2Lumi. Handwriting in, Claude out.
 
+![Quire screenshot](../assets/screenshot.png)
+
 ## Design
 
 Infinite canvas with an elegant pen-and-paper aesthetic, optimised for e-ink stylus input.

@@ -9,7 +9,6 @@ const MAX_SIZE: u32 = 4096;
 /// Render strokes to a white-background RGB image.
 /// Also saves a debug copy to quire_render_debug.png.
 pub fn strokes_to_image(strokes: &[Vec<StrokePoint>]) -> ImageBuffer<Rgb<u8>, Vec<u8>> {
-    // Find bounding box with stroke width margin
     let mut min_x = f64::MAX;
     let mut min_y = f64::MAX;
     let mut max_x = f64::MIN;
@@ -24,7 +23,6 @@ pub fn strokes_to_image(strokes: &[Vec<StrokePoint>]) -> ImageBuffer<Rgb<u8>, Ve
         }
     }
 
-    // Add stroke width to bounding box so edges don't clip
     let margin = PADDING + STROKE_WIDTH;
     let raw_w = max_x - min_x + 2.0 * margin;
     let raw_h = max_y - min_y + 2.0 * margin;
@@ -48,7 +46,6 @@ pub fn strokes_to_image(strokes: &[Vec<StrokePoint>]) -> ImageBuffer<Rgb<u8>, Ve
             let y1 = stroke[i + 1].y - min_y + margin;
             draw_thick_line(&mut img, x0, y0, x1, y1, STROKE_WIDTH, black);
         }
-        // Draw dot for single-point strokes
         if stroke.len() == 1 {
             let x = stroke[0].x - min_x + margin;
             let y = stroke[0].y - min_y + margin;
@@ -56,20 +53,28 @@ pub fn strokes_to_image(strokes: &[Vec<StrokePoint>]) -> ImageBuffer<Rgb<u8>, Ve
         }
     }
 
-    // Save debug copy
     let _ = img.save("quire_render_debug.png");
-
     img
+}
+
+/// Crop a region from an image by pixel coordinates.
+pub fn crop_image(
+    img: &ImageBuffer<Rgb<u8>, Vec<u8>>,
+    x1: u32, y1: u32, x2: u32, y2: u32,
+) -> ImageBuffer<Rgb<u8>, Vec<u8>> {
+    let x1 = x1.min(img.width());
+    let y1 = y1.min(img.height());
+    let x2 = x2.min(img.width()).max(x1 + 1);
+    let y2 = y2.min(img.height()).max(y1 + 1);
+    let w = x2 - x1;
+    let h = y2 - y1;
+    ImageBuffer::from_fn(w, h, |x, y| *img.get_pixel(x1 + x, y1 + y))
 }
 
 fn draw_thick_line(
     img: &mut ImageBuffer<Rgb<u8>, Vec<u8>>,
-    x0: f64,
-    y0: f64,
-    x1: f64,
-    y1: f64,
-    width: f64,
-    color: Rgb<u8>,
+    x0: f64, y0: f64, x1: f64, y1: f64,
+    width: f64, color: Rgb<u8>,
 ) {
     let dx = x1 - x0;
     let dy = y1 - y0;
@@ -78,29 +83,22 @@ fn draw_thick_line(
         draw_filled_circle(img, x0, y0, width / 2.0, color);
         return;
     }
-
     let steps = (len * 2.0) as usize;
     for s in 0..=steps {
         let t = s as f64 / steps as f64;
-        let cx = x0 + dx * t;
-        let cy = y0 + dy * t;
-        draw_filled_circle(img, cx, cy, width / 2.0, color);
+        draw_filled_circle(img, x0 + dx * t, y0 + dy * t, width / 2.0, color);
     }
 }
 
 fn draw_filled_circle(
     img: &mut ImageBuffer<Rgb<u8>, Vec<u8>>,
-    cx: f64,
-    cy: f64,
-    radius: f64,
-    color: Rgb<u8>,
+    cx: f64, cy: f64, radius: f64, color: Rgb<u8>,
 ) {
     let r = radius.ceil() as i32;
     let (w, h) = (img.width() as i32, img.height() as i32);
     let icx = cx as i32;
     let icy = cy as i32;
     let r_sq = radius * radius;
-
     for dy in -r..=r {
         for dx in -r..=r {
             if (dx * dx + dy * dy) as f64 <= r_sq {

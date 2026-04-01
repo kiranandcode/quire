@@ -1,0 +1,482 @@
+[
+  {
+    "model": "GLM-OCR (0.9B)",
+    "avg_sim": 0.14894842674930428,
+    "avg_cer": 3.33436955729181,
+    "avg_time": 0.0023476630449295044,
+    "results": [
+      {
+        "truth": "hello world! Kiran",
+        "pred": "ERROR: 'GlmOcrModel' object has no attribute 'generate'",
+        "sim": 0.1917808219178082,
+        "cer": 2.611111111111111,
+        "time": 0.031659841537475586
+      },
+      {
+        "truth": "hi claude",
+        "pred": "ERROR: 'GlmOcrModel' object has no attribute 'generate'",
+        "sim": 0.125,
+        "cer": 5.666666666666667,
+        "time": 0.000476837158203125
+      },
+      {
+        "truth": "how is OCR being done?",
+        "pred": "ERROR: 'GlmOcrModel' object has no attribute 'generate'",
+        "sim": 0.2077922077922078,
+        "cer": 2.3636363636363638,
+        "time": 0.0005152225494384766
+      },
+      {
+        "truth": "this is crazy!",
+        "pred": "ERROR: 'GlmOcrModel' object has no attribute 'generate'",
+        "sim": 0.11594202898550725,
+        "cer": 3.357142857142857,
+        "time": 0.00035500526428222656
+      },
+      {
+        "truth": "FUCK YOU!",
+        "pred": "ERROR: 'GlmOcrModel' object has no attribute 'generate'",
+        "sim": 0.0625,
+        "cer": 5.888888888888889,
+        "time": 0.0003256797790527344
+      },
+      {
+        "truth": "the capital of Brazil is france",
+        "pred": "ERROR: 'GlmOcrModel' object has no attribute 'generate'",
+        "sim": 0.27906976744186046,
+        "cer": 2.129032258064516,
+        "time": 0.0004329681396484375
+      },
+      {
+        "truth": "faster than light",
+        "pred": "ERROR: 'GlmOcrModel' object has no attribute 'generate'",
+        "sim": 0.2222222222222222,
+        "cer": 3.2941176470588234,
+        "time": 0.00039196014404296875
+      },
+      {
+        "truth": "oestensibly I'm loosing",
+        "pred": "ERROR: 'GlmOcrModel' object has no attribute 'generate'",
+        "sim": 0.20512820512820512,
+        "cer": 2.5652173913043477,
+        "time": 0.0003578662872314453
+      },
+      {
+        "truth": "find the last commit I made",
+        "pred": "ERROR: 'GlmOcrModel' object has no attribute 'generate'",
+        "sim": 0.14634146341463414,
+        "cer": 2.3703703703703702,
+        "time": 0.0004248619079589844
+      },
+      {
+        "truth": "emacsclient -e \"(quit)\"",
+        "pred": "ERROR: 'GlmOcrModel' object has no attribute 'generate'",
+        "sim": 0.20512820512820512,
+        "cer": 2.5217391304347827,
+        "time": 0.00033736228942871094
+      },
+      {
+        "truth": "grep -r \"finder\"",
+        "pred": "ERROR: 'GlmOcrModel' object has no attribute 'generate'",
+        "sim": 0.056338028169014086,
+        "cer": 3.6875,
+        "time": 0.000308990478515625
+      },
+      {
+        "truth": "okay so brainstorming here",
+        "pred": "ERROR: 'GlmOcrModel' object has no attribute 'generate'",
+        "sim": 0.07407407407407407,
+        "cer": 2.1923076923076925,
+        "time": 0.0005180835723876953
+      },
+      {
+        "truth": "kill---your---self",
+        "pred": "ERROR: 'GlmOcrModel' object has no attribute 'generate'",
+        "sim": 0.0821917808219178,
+        "cer": 3.111111111111111,
+        "time": 0.0004208087921142578
+      },
+      {
+        "truth": "hi claude!",
+        "pred": "ERROR: 'GlmOcrModel' object has no attribute 'generate'",
+        "sim": 0.12307692307692308,
+        "cer": 5.1,
+        "time": 0.00037217140197753906
+      },
+      {
+        "truth": "/what the heck?/",
+        "pred": "ERROR: 'GlmOcrModel' object has no attribute 'generate'",
+        "sim": 0.11267605633802817,
+        "cer": 3.0625,
+        "time": 0.00033402442932128906
+      },
+      {
+        "truth": "_I don't know_",
+        "pred": "ERROR: 'GlmOcrModel' object has no attribute 'generate'",
+        "sim": 0.17391304347826086,
+        "cer": 3.4285714285714284,
+        "time": 0.00033092498779296875
+      }
+    ]
+  },
+  {
+    "model": "LightOnOCR-2-1B",
+    "avg_sim": 0.12482525070764924,
+    "avg_cer": 4.648571779333539,
+    "avg_time": 4.3199678510427475,
+    "results": [
+      {
+        "truth": "hello world! Kiran",
+        "pred": "ERROR: Image features and image tokens do not match, tokens: 0, features: 92160",
+        "sim": 0.16494845360824742,
+        "cer": 4.055555555555555,
+        "time": 3.5214898586273193
+      },
+      {
+        "truth": "hi claude",
+        "pred": "ERROR: Image features and image tokens do not match, tokens: 0, features: 56320",
+        "sim": 0.022727272727272728,
+        "cer": 8.222222222222221,
+        "time": 2.04876708984375
+      },
+      {
+        "truth": "how is OCR being done?",
+        "pred": "ERROR: Image features and image tokens do not match, tokens: 0, features: 135168",
+        "sim": 0.23529411764705882,
+        "cer": 3.727272727272727,
+        "time": 5.902225017547607
+      },
+      {
+        "truth": "this is crazy!",
+        "pred": "ERROR: Image features and image tokens do not match, tokens: 0, features: 79872",
+        "sim": 0.10752688172043011,
+        "cer": 5.071428571428571,
+        "time": 3.0498969554901123
+      },
+      {
+        "truth": "FUCK YOU!",
+        "pred": "ERROR: Image features and image tokens do not match, tokens: 0, features: 71680",
+        "sim": 0.045454545454545456,
+        "cer": 8.666666666666666,
+        "time": 2.7282209396362305
+      },
+      {
+        "truth": "the capital of Brazil is france",
+        "pred": "ERROR: Image features and image tokens do not match, tokens: 0, features: 129024",
+        "sim": 0.18018018018018017,
+        "cer": 2.6451612903225805,
+        "time": 5.589554071426392
+      },
+      {
+        "truth": "faster than light",
+        "pred": "ERROR: Image features and image tokens do not match, tokens: 0, features: 107520",
+        "sim": 0.20618556701030927,
+        "cer": 4.235294117647059,
+        "time": 4.742881774902344
+      },
+      {
+        "truth": "oestensibly I'm loosing",
+        "pred": "ERROR: Image features and image tokens do not match, tokens: 0, features: 104448",
+        "sim": 0.1941747572815534,
+        "cer": 3.1739130434782608,
+        "time": 4.624639987945557
+      },
+      {
+        "truth": "find the last commit I made",
+        "pred": "ERROR: Image features and image tokens do not match, tokens: 0, features: 116736",
+        "sim": 0.24299065420560748,
+        "cer": 2.8518518518518516,
+        "time": 5.930613040924072
+      },
+      {
+        "truth": "emacsclient -e \"(quit)\"",
+        "pred": "ERROR: Image features and image tokens do not match, tokens: 0, features: 92160",
+        "sim": 0.11764705882352941,
+        "cer": 2.9565217391304346,
+        "time": 4.377003908157349
+      },
+      {
+        "truth": "grep -r \"finder\"",
+        "pred": "ERROR: Image features and image tokens do not match, tokens: 0, features: 71680",
+        "sim": 0.042105263157894736,
+        "cer": 4.75,
+        "time": 3.300650119781494
+      },
+      {
+        "truth": "okay so brainstorming here",
+        "pred": "ERROR: Image features and image tokens do not match, tokens: 0, features: 129024",
+        "sim": 0.05660377358490566,
+        "cer": 2.9615384615384617,
+        "time": 7.252168893814087
+      },
+      {
+        "truth": "kill---your---self",
+        "pred": "ERROR: Image features and image tokens do not match, tokens: 0, features: 98304",
+        "sim": 0.10309278350515463,
+        "cer": 4.222222222222222,
+        "time": 5.533771991729736
+      },
+      {
+        "truth": "hi claude!",
+        "pred": "ERROR: Image features and image tokens do not match, tokens: 0, features: 56320",
+        "sim": 0.02247191011235955,
+        "cer": 7.4,
+        "time": 2.714884042739868
+      },
+      {
+        "truth": "/what the heck?/",
+        "pred": "ERROR: Image features and image tokens do not match, tokens: 0, features: 81920",
+        "sim": 0.10526315789473684,
+        "cer": 4.4375,
+        "time": 4.263197898864746
+      },
+      {
+        "truth": "_I don't know_",
+        "pred": "ERROR: Image features and image tokens do not match, tokens: 0, features: 66560",
+        "sim": 0.15053763440860216,
+        "cer": 5.0,
+        "time": 3.539520025253296
+      }
+    ]
+  },
+  {
+    "model": "Nanonets-OCR-s (3B)",
+    "avg_sim": 0.12898970609696853,
+    "avg_cer": 4.4764925012098695,
+    "avg_time": 5.697754576802254,
+    "results": [
+      {
+        "truth": "hello world! Kiran",
+        "pred": "ERROR: Image features and image tokens do not match, tokens: 0, features: 85",
+        "sim": 0.1702127659574468,
+        "cer": 4.055555555555555,
+        "time": 6.736810922622681
+      },
+      {
+        "truth": "hi claude",
+        "pred": "ERROR: Image features and image tokens do not match, tokens: 0, features: 40",
+        "sim": 0.023529411764705882,
+        "cer": 7.888888888888889,
+        "time": 3.159695863723755
+      },
+      {
+        "truth": "how is OCR being done?",
+        "pred": "ERROR: Image features and image tokens do not match, tokens: 0, features: 105",
+        "sim": 0.24242424242424243,
+        "cer": 3.590909090909091,
+        "time": 8.261446952819824
+      },
+      {
+        "truth": "this is crazy!",
+        "pred": "ERROR: Image features and image tokens do not match, tokens: 0, features: 60",
+        "sim": 0.1111111111111111,
+        "cer": 4.857142857142857,
+        "time": 4.715220928192139
+      },
+      {
+        "truth": "FUCK YOU!",
+        "pred": "ERROR: Image features and image tokens do not match, tokens: 0, features: 65",
+        "sim": 0.047058823529411764,
+        "cer": 8.333333333333334,
+        "time": 4.907841205596924
+      },
+      {
+        "truth": "the capital of Brazil is france",
+        "pred": "ERROR: Image features and image tokens do not match, tokens: 0, features: 105",
+        "sim": 0.18518518518518517,
+        "cer": 2.5483870967741935,
+        "time": 8.025326251983643
+      },
+      {
+        "truth": "faster than light",
+        "pred": "ERROR: Image features and image tokens do not match, tokens: 0, features: 84",
+        "sim": 0.21505376344086022,
+        "cer": 4.176470588235294,
+        "time": 6.499572992324829
+      },
+      {
+        "truth": "oestensibly I'm loosing",
+        "pred": "ERROR: Image features and image tokens do not match, tokens: 0, features: 102",
+        "sim": 0.2,
+        "cer": 3.0434782608695654,
+        "time": 7.6099419593811035
+      },
+      {
+        "truth": "find the last commit I made",
+        "pred": "ERROR: Image features and image tokens do not match, tokens: 0, features: 90",
+        "sim": 0.2524271844660194,
+        "cer": 2.7037037037037037,
+        "time": 6.558647871017456
+      },
+      {
+        "truth": "emacsclient -e \"(quit)\"",
+        "pred": "ERROR: Image features and image tokens do not match, tokens: 0, features: 85",
+        "sim": 0.12121212121212122,
+        "cer": 2.8260869565217392,
+        "time": 6.09493613243103
+      },
+      {
+        "truth": "grep -r \"finder\"",
+        "pred": "ERROR: Image features and image tokens do not match, tokens: 0, features: 65",
+        "sim": 0.043478260869565216,
+        "cer": 4.5625,
+        "time": 4.564981937408447
+      },
+      {
+        "truth": "okay so brainstorming here",
+        "pred": "ERROR: Image features and image tokens do not match, tokens: 0, features: 100",
+        "sim": 0.05825242718446602,
+        "cer": 2.8461538461538463,
+        "time": 7.476061820983887
+      },
+      {
+        "truth": "kill---your---self",
+        "pred": "ERROR: Image features and image tokens do not match, tokens: 0, features: 75",
+        "sim": 0.10638297872340426,
+        "cer": 4.055555555555555,
+        "time": 5.288777112960815
+      },
+      {
+        "truth": "hi claude!",
+        "pred": "ERROR: Image features and image tokens do not match, tokens: 0, features: 40",
+        "sim": 0.023255813953488372,
+        "cer": 7.1,
+        "time": 2.8408432006835938
+      },
+      {
+        "truth": "/what the heck?/",
+        "pred": "ERROR: Image features and image tokens do not match, tokens: 0, features: 60",
+        "sim": 0.10869565217391304,
+        "cer": 4.25,
+        "time": 4.035562038421631
+      },
+      {
+        "truth": "_I don't know_",
+        "pred": "ERROR: Image features and image tokens do not match, tokens: 0, features: 65",
+        "sim": 0.15555555555555556,
+        "cer": 4.785714285714286,
+        "time": 4.388406038284302
+      }
+    ]
+  },
+  {
+    "model": "Claude Sonnet Vision",
+    "avg_sim": 0.9521691020332325,
+    "avg_cer": 0.07312611150926368,
+    "avg_time": 1.4729331880807877,
+    "results": [
+      {
+        "truth": "hello world! Kiran",
+        "pred": "hello world! Kwan",
+        "sim": 0.9142857142857143,
+        "cer": 0.1111111111111111,
+        "time": 1.4923481941223145
+      },
+      {
+        "truth": "hi claude",
+        "pred": "hi claude",
+        "sim": 1.0,
+        "cer": 0.0,
+        "time": 1.3633637428283691
+      },
+      {
+        "truth": "how is OCR being done?",
+        "pred": "how is OCR being done?",
+        "sim": 1.0,
+        "cer": 0.0,
+        "time": 1.070039987564087
+      },
+      {
+        "truth": "this is crazy!",
+        "pred": "This is crazy!",
+        "sim": 1.0,
+        "cer": 0.07142857142857142,
+        "time": 1.7897038459777832
+      },
+      {
+        "truth": "FUCK YOU!",
+        "pred": "FUCK YOU!",
+        "sim": 1.0,
+        "cer": 0.0,
+        "time": 1.450038194656372
+      },
+      {
+        "truth": "the capital of Brazil is france",
+        "pred": "the capital of Brazil is france",
+        "sim": 1.0,
+        "cer": 0.0,
+        "time": 1.5093281269073486
+      },
+      {
+        "truth": "faster than light",
+        "pred": "faster than light",
+        "sim": 1.0,
+        "cer": 0.0,
+        "time": 1.0767059326171875
+      },
+      {
+        "truth": "oestensibly I'm loosing",
+        "pred": "Ostensibly I'm leaving",
+        "sim": 0.8444444444444444,
+        "cer": 0.21739130434782608,
+        "time": 1.7262241840362549
+      },
+      {
+        "truth": "find the last commit I made",
+        "pred": "find the last commit I made",
+        "sim": 1.0,
+        "cer": 0.0,
+        "time": 1.1448969841003418
+      },
+      {
+        "truth": "emacsclient -e \"(quit)\"",
+        "pred": "emacsclient -c \"(guix)\"",
+        "sim": 0.8695652173913043,
+        "cer": 0.13043478260869565,
+        "time": 1.1982581615447998
+      },
+      {
+        "truth": "grep -r \"finder\"",
+        "pred": "grep -r \"finder\"",
+        "sim": 1.0,
+        "cer": 0.0,
+        "time": 2.5184590816497803
+      },
+      {
+        "truth": "okay so brainstorming here",
+        "pred": "Okay so brainstorming here",
+        "sim": 1.0,
+        "cer": 0.038461538461538464,
+        "time": 2.4419748783111572
+      },
+      {
+        "truth": "kill---your---self",
+        "pred": "kill your self",
+        "sim": 0.75,
+        "cer": 0.3333333333333333,
+        "time": 1.434356927871704
+      },
+      {
+        "truth": "hi claude!",
+        "pred": "hi claude!",
+        "sim": 1.0,
+        "cer": 0.0,
+        "time": 1.4989421367645264
+      },
+      {
+        "truth": "/what the heck?/",
+        "pred": "what the heck?",
+        "sim": 0.9333333333333333,
+        "cer": 0.125,
+        "time": 1.0289738178253174
+      },
+      {
+        "truth": "_I don't know_",
+        "pred": "I don't know",
+        "sim": 0.9230769230769231,
+        "cer": 0.14285714285714285,
+        "time": 0.8233168125152588
+      }
+    ]
+  }
+]

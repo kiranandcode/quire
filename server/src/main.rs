@@ -93,18 +93,84 @@ async fn chat_handler(
         return Err((StatusCode::BAD_REQUEST, "No strokes".into()));
     }
 
-    // OCR
     log::log("chat_request", &serde_json::json!({"stroke_count": req.strokes.len(), "session_id": &req.session_id}));
-    let img = render::strokes_to_image(&req.strokes);
-    let ocr_text = ocr::recognize(&img, state.ocr_port).await.map_err(|e| {
-        log::log("chat_ocr_error", &serde_json::json!({"error": e.to_string()}));
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("OCR failed: {e}"))
-    })?;
-    log::log("chat_ocr_result", &serde_json::json!({"text": &ocr_text}));
 
-    if ocr_text.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "OCR returned empty".into()));
-    }
+    // Render strokes to image
+    let img = render::strokes_to_image(&req.strokes);
+
+    // Detect text vs image regions via bbox model
+    let regions = ocr::detect(&img, state.ocr_port).await.map_err(|e| {
+        log::log("chat_detect_error", &serde_json::json!({"error": e.to_string()}));
+        // Fallback: try pure OCR if detect fails
+        e
+    });
+
+    // Build message parts based on detected regions
+    let (parts, ocr_text) = if let Ok(regions) = regions {
+        let mut parts = Vec::new();
+        let mut all_text = String::new();
+
+        let has_images = regions.iter().any(|r| r.region_type == "image");
+        log::log("chat_detect_result", &serde_json::json!({
+            "region_count": regions.len(),
+            "has_images": has_images,
+            "regions": regions.iter().map(|r| &r.region_type).collect::<Vec<_>>(),
+        }));
+
+        for region in &regions {
+            match region.region_type.as_str() {
+                "text" => {
+                    if let Some(ref text) = region.content {
+                        if !text.is_empty() {
+                            all_text.push_str(text);
+                            all_text.push(' ');
+                            parts.push(claude::ContentPart::Text(text.clone()));
+                        }
+                    }
+                }
+                "image" => {
+                    if let Some(bbox) = &region.bbox {
+                        // Crop the image region and encode as base64 PNG
+                        let cropped = render::crop_image(&img, bbox[0], bbox[1], bbox[2], bbox[3]);
+                        let mut buf = Vec::new();
+                        use std::io::Cursor;
+                        if cropped.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png).is_ok() {
+                            let b64 = base64::Engine::encode(
+                                &base64::engine::general_purpose::STANDARD, &buf
+                            );
+                            parts.push(claude::ContentPart::Text(
+                                "[The user drew a diagram/image here:]".into()
+                            ));
+                            parts.push(claude::ContentPart::ImageBase64 {
+                                media_type: "image/png".into(),
+                                data: b64,
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if parts.is_empty() {
+            return Err((StatusCode::BAD_REQUEST, "No content detected".into()));
+        }
+
+        (parts, all_text.trim().to_string())
+    } else {
+        // Fallback to pure OCR
+        let ocr_text = ocr::recognize(&img, state.ocr_port).await.map_err(|e| {
+            log::log("chat_ocr_error", &serde_json::json!({"error": e.to_string()}));
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("OCR failed: {e}"))
+        })?;
+        log::log("chat_ocr_fallback", &serde_json::json!({"text": &ocr_text}));
+        if ocr_text.is_empty() {
+            return Err((StatusCode::BAD_REQUEST, "OCR returned empty".into()));
+        }
+        (vec![claude::ContentPart::Text(ocr_text.clone())], ocr_text)
+    };
+
+    log::log("chat_ocr_result", &serde_json::json!({"text": &ocr_text}));
 
     // Session management
     let session_id = req
@@ -114,22 +180,23 @@ async fn chat_handler(
     let mut sessions = state.sessions.lock().await;
     let history = sessions.entry(session_id.clone()).or_default();
 
-    // Add user message
-    history.push(ClaudeMessage {
-        role: "user".into(),
-        content: ocr_text.clone(),
-    });
+    // Build the mixed-content message
+    let user_msg = claude::build_multipart_message(&parts);
 
-    // Call Claude
-    let response_text = claude::chat(&state.anthropic_key, history)
+    // Call Claude with history + new mixed message
+    let response_text = claude::chat_mixed(&state.anthropic_key, history, user_msg)
         .await
         .map_err(|e| {
-            history.pop();
             log::log("chat_claude_error", &serde_json::json!({"error": e.to_string()}));
             (StatusCode::INTERNAL_SERVER_ERROR, format!("Claude failed: {e}"))
         })?;
     log::log("chat_claude_response", &serde_json::json!({"text": &response_text, "session_id": &session_id}));
 
+    // Store text summary in history for future context
+    history.push(ClaudeMessage {
+        role: "user".into(),
+        content: if ocr_text.is_empty() { "[sent an image]".into() } else { ocr_text.clone() },
+    });
     history.push(ClaudeMessage {
         role: "assistant".into(),
         content: response_text.clone(),
