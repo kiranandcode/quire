@@ -2,7 +2,7 @@
 
 E-ink AI interface for Boox Go 10.3 2Lumi. Handwriting in, Claude out.
 
-![Quire screenshot](../assets/screenshot.png)
+![Quire screenshot](assets/screenshot.png)
 
 ## Design
 
