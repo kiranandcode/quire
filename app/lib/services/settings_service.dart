@@ -5,9 +5,11 @@ class SettingsService {
   static const _keyPort = 'backend_port';
   static const _keyPassword = 'backend_password';
   static const _keyDebug = 'debug_mode';
+  static const _keyModel = 'claude_model';
 
   static const defaultAddress = 'localhost';
   static const defaultPort = 8080;
+  static const defaultModel = 'claude-sonnet-4-20250514';
 
   static final SettingsService _instance = SettingsService._();
   factory SettingsService() => _instance;
@@ -39,6 +41,12 @@ class SettingsService {
 
   Future<void> setDebugMode(bool enabled) async {
     await _prefs?.setBool(_keyDebug, enabled);
+  }
+
+  String get claudeModel => _prefs?.getString(_keyModel) ?? defaultModel;
+
+  Future<void> setClaudeModel(String model) async {
+    await _prefs?.setString(_keyModel, model);
   }
 
   String get backendUrl => 'http://$backendAddress:$backendPort';

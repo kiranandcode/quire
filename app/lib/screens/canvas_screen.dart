@@ -185,6 +185,22 @@ class _CanvasScreenState extends State<CanvasScreen> {
   }
 
   void _onClaudeStrokeComplete(StrokeObject stroke) {
+    final bb = stroke.boundingBox;
+    final isPhantom = _isPhantomStroke(stroke);
+
+    DebugService.trace('stroke_end', {
+      'tool': 'claude',
+      'points': stroke.points.length,
+      'width': bb.width,
+      'height': bb.height,
+      'ratio': bb.height > 0 ? bb.width / bb.height : 0,
+      'phantom': isPhantom,
+      'first_pt': {'x': stroke.points.first.x, 'y': stroke.points.first.y, 'p': stroke.points.first.pressure},
+      'last_pt': {'x': stroke.points.last.x, 'y': stroke.points.last.y, 'p': stroke.points.last.pressure},
+    });
+
+    if (isPhantom) return;
+
     setState(() {
       _objects.add(stroke);
       _claudeStrokeBuffer.add(stroke);
@@ -193,10 +209,10 @@ class _CanvasScreenState extends State<CanvasScreen> {
     DebugService.trace('claude_stroke', {
       'buffer_size': _claudeStrokeBuffer.length,
       'bounds': {
-        'l': stroke.boundingBox.left,
-        't': stroke.boundingBox.top,
-        'r': stroke.boundingBox.right,
-        'b': stroke.boundingBox.bottom,
+        'l': bb.left,
+        't': bb.top,
+        'r': bb.right,
+        'b': bb.bottom,
       },
     });
 
@@ -281,51 +297,62 @@ class _CanvasScreenState extends State<CanvasScreen> {
     Rect strokeBounds,
   ) async {
     try {
-      final response = await ChatService.chat(
+      // Create the response TextObject immediately — we'll fill it as deltas arrive
+      final responseY = thinking.position.dy;
+      final responseText = TextObject(
+        text: '',
+        position: Offset(strokeBounds.left, responseY),
+        fontSize: 20,
+      );
+      double lastHeight = 0;
+
+      final response = await ChatService.chatStream(
         strokes,
         sessionId: thread.sessionId,
+        onDelta: (delta) {
+          if (!mounted) return;
+          setState(() {
+            // On first delta, swap thinking indicator for the response object
+            if (_objects.contains(thinking)) {
+              _objects.remove(thinking);
+              _thinkingAnimTimer?.cancel();
+              _objects.add(responseText);
+            }
+            responseText.text += delta;
+
+            // Shift objects below as response grows
+            final newHeight = responseText.boundingBox.height + 20;
+            final heightDelta = newHeight - lastHeight;
+            if (heightDelta > 0) {
+              for (final obj in _objects) {
+                if (obj == responseText) continue;
+                if (obj.boundingBox.top > responseY - 5) {
+                  obj.translate(Offset(0, heightDelta));
+                }
+              }
+              // Compensate canvas if user is writing below
+              if (_currentStroke != null &&
+                  _currentStroke!.boundingBox.top > responseY - 20) {
+                _offset = _offset - Offset(0, heightDelta * _scale);
+              }
+              lastHeight = newHeight;
+            }
+          });
+        },
       );
 
       if (!mounted) return;
 
       DebugService.trace('claude_response', {'ocr': response.ocrText, 'response_len': response.text.length, 'session': response.sessionId});
       setState(() {
-        _objects.remove(thinking);
+        // Ensure thinking is removed (in case no deltas arrived)
+        if (_objects.contains(thinking)) {
+          _objects.remove(thinking);
+          _objects.add(responseText);
+        }
         thread.isWaitingForResponse = false;
-
-        // Position for Claude's response: below the user strokes
-        final responseY = thinking.position.dy;
-
-        // Check if user is currently writing below the thinking indicator
-        final inProgressBelow = _currentStroke != null &&
-            _currentStroke!.boundingBox.top > responseY - 20;
-
-        final responseText = TextObject(
-          text: response.text,
-          position: Offset(strokeBounds.left, responseY),
-          fontSize: 20,
-          sessionId: response.sessionId,
-          ocrSource: response.ocrText,
-        );
-        _objects.add(responseText);
-
-        final responseHeight = responseText.boundingBox.height + 20;
-
-        // Shift everything below the response position down
-        for (final obj in _objects) {
-          if (obj == responseText) continue;
-          if (obj.boundingBox.top > responseY - 5) {
-            obj.translate(Offset(0, responseHeight));
-          }
-        }
-
-        // If user was writing below, compensate the canvas offset
-        // so their pen position doesn't jump
-        if (inProgressBelow) {
-          _offset = _offset - Offset(0, responseHeight * _scale);
-        }
-
-        // Update thread session
+        responseText.sessionId = response.sessionId;
+        responseText.ocrSource = response.ocrText;
         thread.sessionId = response.sessionId;
       });
     } catch (e) {
@@ -467,10 +494,30 @@ class _CanvasScreenState extends State<CanvasScreen> {
     }
   }
 
+  bool _isPhantomStroke(StrokeObject stroke) {
+    final bb = stroke.boundingBox;
+    return bb.height > 0 && bb.width / bb.height > 8 && bb.width > 100;
+  }
+
   void _handleStylusEnd() {
     if (_activeTool == Tool.pen && _currentStroke != null) {
+      final stroke = _currentStroke!;
+      final bb = stroke.boundingBox;
+      final isPhantom = _isPhantomStroke(stroke);
+      DebugService.trace('stroke_end', {
+        'tool': 'pen',
+        'points': stroke.points.length,
+        'width': bb.width,
+        'height': bb.height,
+        'ratio': bb.height > 0 ? bb.width / bb.height : 0,
+        'phantom': isPhantom,
+        'first_pt': {'x': stroke.points.first.x, 'y': stroke.points.first.y, 'p': stroke.points.first.pressure},
+        'last_pt': {'x': stroke.points.last.x, 'y': stroke.points.last.y, 'p': stroke.points.last.pressure},
+      });
       setState(() {
-        _objects.add(_currentStroke!);
+        if (!isPhantom) {
+          _objects.add(stroke);
+        }
         _currentStroke = null;
       });
     } else if (_activeTool == Tool.claude && _currentStroke != null) {

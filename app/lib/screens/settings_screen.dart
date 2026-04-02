@@ -14,6 +14,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late TextEditingController _portController;
   late TextEditingController _passwordController;
   final _settings = SettingsService();
+  late String _selectedModel;
 
   @override
   void initState() {
@@ -24,6 +25,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         TextEditingController(text: _settings.backendPort.toString());
     _passwordController =
         TextEditingController(text: _settings.backendPassword);
+    _selectedModel = _settings.claudeModel;
   }
 
   @override
@@ -42,6 +44,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _settings.setBackendAddress(address);
     _settings.setBackendPort(port);
     _settings.setBackendPassword(_passwordController.text);
+    _settings.setClaudeModel(_selectedModel);
     Navigator.of(context).pop();
   }
 
@@ -118,6 +121,27 @@ class _SettingsScreenState extends State<SettingsScreen> {
             Text(
               'Streams trace events to server for logging',
               style: TextStyle(fontSize: 14, color: Colors.grey.shade600),
+            ),
+            const SizedBox(height: 24),
+            const Text(
+              'Claude Model',
+              style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 12),
+            DropdownButtonFormField<String>(
+              initialValue: _selectedModel,
+              decoration: const InputDecoration(
+                labelText: 'Model',
+              ),
+              style: const TextStyle(fontSize: 18, color: Colors.black),
+              items: const [
+                DropdownMenuItem(value: 'claude-sonnet-4-20250514', child: Text('Sonnet 4')),
+                DropdownMenuItem(value: 'claude-opus-4-20250514', child: Text('Opus 4')),
+                DropdownMenuItem(value: 'claude-haiku-4-20250414', child: Text('Haiku 4')),
+              ],
+              onChanged: (v) {
+                if (v != null) setState(() => _selectedModel = v);
+              },
             ),
             const SizedBox(height: 24),
             ElevatedButton(

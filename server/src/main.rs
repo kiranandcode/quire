@@ -7,14 +7,17 @@ use axum::{
     body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
+    response::sse::{Event, Sse},
     routing::{get, post},
     Json, Router,
 };
 use claude::ClaudeMessage;
+use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::CorsLayer;
 
 struct AppState {
@@ -73,6 +76,8 @@ struct ChatRequest {
     strokes: Vec<Vec<StrokePoint>>,
     #[serde(default)]
     session_id: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -183,8 +188,10 @@ async fn chat_handler(
     // Build the mixed-content message
     let user_msg = claude::build_multipart_message(&parts);
 
+    let model = req.model.as_deref().unwrap_or(claude::DEFAULT_MODEL);
+
     // Call Claude with history + new mixed message
-    let response_text = claude::chat_mixed(&state.anthropic_key, history, user_msg)
+    let response_text = claude::chat_mixed(&state.anthropic_key, history, user_msg, model)
         .await
         .map_err(|e| {
             log::log("chat_claude_error", &serde_json::json!({"error": e.to_string()}));
@@ -207,6 +214,154 @@ async fn chat_handler(
         ocr_text,
         session_id,
     }))
+}
+
+// --- Streaming Chat endpoint ---
+
+async fn chat_stream_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<ChatRequest>,
+) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, (StatusCode, String)> {
+    check_auth(&state, &headers).map_err(|s| (s, "Unauthorized".into()))?;
+
+    if req.strokes.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "No strokes".into()));
+    }
+
+    log::log("chat_stream_request", &serde_json::json!({"stroke_count": req.strokes.len(), "session_id": &req.session_id}));
+
+    // Render strokes to image
+    let img = render::strokes_to_image(&req.strokes);
+
+    // Detect text vs image regions
+    let regions = ocr::detect(&img, state.ocr_port).await.map_err(|e| {
+        log::log("chat_detect_error", &serde_json::json!({"error": e.to_string()}));
+        e
+    });
+
+    let (parts, ocr_text) = if let Ok(regions) = regions {
+        let mut parts = Vec::new();
+        let mut all_text = String::new();
+
+        for region in &regions {
+            match region.region_type.as_str() {
+                "text" => {
+                    if let Some(ref text) = region.content {
+                        if !text.is_empty() {
+                            all_text.push_str(text);
+                            all_text.push(' ');
+                            parts.push(claude::ContentPart::Text(text.clone()));
+                        }
+                    }
+                }
+                "image" => {
+                    if let Some(bbox) = &region.bbox {
+                        let cropped = render::crop_image(&img, bbox[0], bbox[1], bbox[2], bbox[3]);
+                        let mut buf = Vec::new();
+                        use std::io::Cursor;
+                        if cropped.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png).is_ok() {
+                            let b64 = base64::Engine::encode(
+                                &base64::engine::general_purpose::STANDARD, &buf
+                            );
+                            parts.push(claude::ContentPart::Text(
+                                "[The user drew a diagram/image here:]".into()
+                            ));
+                            parts.push(claude::ContentPart::ImageBase64 {
+                                media_type: "image/png".into(),
+                                data: b64,
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if parts.is_empty() {
+            return Err((StatusCode::BAD_REQUEST, "No content detected".into()));
+        }
+
+        (parts, all_text.trim().to_string())
+    } else {
+        let ocr_text = ocr::recognize(&img, state.ocr_port).await.map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("OCR failed: {e}"))
+        })?;
+        if ocr_text.is_empty() {
+            return Err((StatusCode::BAD_REQUEST, "OCR returned empty".into()));
+        }
+        (vec![claude::ContentPart::Text(ocr_text.clone())], ocr_text)
+    };
+
+    // Session management
+    let session_id = req
+        .session_id
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    let history = {
+        let sessions = state.sessions.lock().await;
+        sessions.get(&session_id).cloned().unwrap_or_default()
+    };
+
+    let user_msg = claude::build_multipart_message(&parts);
+
+    // Set up streaming channel
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+
+    // Send initial metadata event with session_id and ocr_text
+    let (sse_tx, sse_rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(64);
+
+    let init_event = Event::default()
+        .event("metadata")
+        .data(serde_json::json!({"session_id": &session_id, "ocr_text": &ocr_text}).to_string());
+    let _ = sse_tx.send(Ok(init_event)).await;
+
+    // Spawn task to forward Claude deltas as SSE events
+    let sse_tx_clone = sse_tx.clone();
+    tokio::spawn(async move {
+        let mut rx = rx;
+        while let Some(delta) = rx.recv().await {
+            let event = Event::default().event("delta").data(delta);
+            if sse_tx_clone.send(Ok(event)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Spawn task to call Claude and handle completion
+    let api_key = state.anthropic_key.clone();
+    let model = req.model.as_deref().unwrap_or(claude::DEFAULT_MODEL).to_string();
+    let session_id_clone = session_id.clone();
+    let ocr_text_clone = ocr_text.clone();
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        match claude::chat_mixed_stream(&api_key, &history, user_msg, &model, tx).await {
+            Ok(full_text) => {
+                log::log("chat_stream_response", &serde_json::json!({
+                    "text": &full_text, "session_id": &session_id_clone
+                }));
+                // Store in session history
+                let mut sessions = state_clone.sessions.lock().await;
+                let hist = sessions.entry(session_id_clone).or_default();
+                hist.push(ClaudeMessage {
+                    role: "user".into(),
+                    content: if ocr_text_clone.is_empty() { "[sent an image]".into() } else { ocr_text_clone },
+                });
+                hist.push(ClaudeMessage {
+                    role: "assistant".into(),
+                    content: full_text,
+                });
+                let _ = sse_tx.send(Ok(Event::default().event("done").data(""))).await;
+            }
+            Err(e) => {
+                log::log("chat_stream_error", &serde_json::json!({"error": &e}));
+                let _ = sse_tx.send(Ok(Event::default().event("error").data(e))).await;
+            }
+        }
+    });
+
+    let stream = ReceiverStream::new(sse_rx);
+    Ok(Sse::new(stream))
 }
 
 // --- Auth ---
@@ -339,6 +494,7 @@ async fn main() {
     let app = Router::new()
         .route("/ocr", post(ocr_handler))
         .route("/chat", post(chat_handler))
+        .route("/chat/stream", post(chat_stream_handler))
         .route("/detect", post(detect_handler))
         .route("/debug", post(debug_handler))
         .route("/screenshot", post(screenshot_handler))
