@@ -12,7 +12,9 @@ import '../services/ocr_service.dart';
 import '../services/settings_service.dart';
 import 'settings_screen.dart';
 
-enum Tool { pen, select, claude }
+enum Tool { pen, select }
+
+enum PenFlowState { idle, debouncing, detecting, countdown, paused, review, sending }
 
 const _thinkingWords = [
   'thinking...',
@@ -64,13 +66,11 @@ class _CanvasScreenState extends State<CanvasScreen> {
   Offset? _focalAtGestureStart;
 
   bool _isStylusGesture = false;
-  Offset? _pointerDownWorld; // capture first point before gesture recognizer
-  final List<Offset> _earlyMovePoints = []; // points before gesture starts
+  Offset? _pointerDownWorld;
+  final List<Offset> _earlyMovePoints = [];
 
-  // Claude pen state
+  // Conversation threads
   final List<ConversationThread> _threads = [];
-  Timer? _debounceTimer;
-  List<StrokeObject> _claudeStrokeBuffer = [];
   Timer? _thinkingAnimTimer;
   final _random = math.Random();
 
@@ -78,8 +78,22 @@ class _CanvasScreenState extends State<CanvasScreen> {
   int _nextConversationLabel = 0;
   final Map<String, String> _threadLabels = {};
 
+  // Pen flow state machine
+  PenFlowState _penFlowState = PenFlowState.idle;
+  List<DetectedRegion> _detectedRegions = [];
+  Rect? _detectionStrokeBounds;
+  List<StrokeObject> _detectionStrokes = [];
+  List<CanvasObject> _previewObjects = [];
+  double _countdownRemaining = 5.0;
+  static const _countdownDuration = 5.0;
+  Timer? _countdownTimer;
+  Timer? _pauseTimer;
+  Timer? _debounceTimer;
+  final List<StrokeObject> _strokeBuffer = [];
+
   static const _debounceMs = 2500;
-  static const _parallelThresholdFactor = 0.6; // fraction of screen width
+  static const _parallelThresholdFactor = 0.6;
+  static const _pauseDurationMs = 10000;
 
   String _labelForIndex(int index) {
     String label = '';
@@ -113,11 +127,19 @@ class _CanvasScreenState extends State<CanvasScreen> {
       _currentStroke = null;
       _clearSelection();
       _threads.clear();
-      _claudeStrokeBuffer.clear();
+      _strokeBuffer.clear();
       _debounceTimer?.cancel();
       _thinkingAnimTimer?.cancel();
+      _countdownTimer?.cancel();
+      _pauseTimer?.cancel();
       _threadLabels.clear();
       _nextConversationLabel = 0;
+      _penFlowState = PenFlowState.idle;
+      _detectedRegions = [];
+      _detectionStrokeBounds = null;
+      _detectionStrokes = [];
+      _previewObjects = [];
+      _countdownRemaining = _countdownDuration;
     });
   }
 
@@ -187,12 +209,11 @@ class _CanvasScreenState extends State<CanvasScreen> {
     }
   }
 
-  // --- Claude pen ---
+  // --- Pen flow: detection → preview → countdown → send ---
 
   ConversationThread? _findThread(double xMin, double xMax) {
     final threshold = _parallelThreshold;
     for (final t in _threads) {
-      // Check if horizontal ranges overlap with generous margin
       if (xMin < t.xMax + threshold && xMax > t.xMin - threshold) {
         return t;
       }
@@ -200,12 +221,12 @@ class _CanvasScreenState extends State<CanvasScreen> {
     return null;
   }
 
-  void _onClaudeStrokeComplete(StrokeObject stroke) {
+  void _onPenStrokeComplete(StrokeObject stroke) {
     final bb = stroke.boundingBox;
     final isPhantom = _isPhantomStroke(stroke);
 
     DebugService.trace('stroke_end', {
-      'tool': 'claude',
+      'tool': 'pen',
       'points': stroke.points.length,
       'width': bb.width,
       'height': bb.height,
@@ -219,54 +240,296 @@ class _CanvasScreenState extends State<CanvasScreen> {
 
     setState(() {
       _objects.add(stroke);
-      _claudeStrokeBuffer.add(stroke);
+      _strokeBuffer.add(stroke);
     });
 
-    DebugService.trace('claude_stroke', {
-      'buffer_size': _claudeStrokeBuffer.length,
-      'bounds': {
-        'l': bb.left,
-        't': bb.top,
-        'r': bb.right,
-        'b': bb.bottom,
-      },
+    DebugService.trace('pen_stroke', {
+      'buffer_size': _strokeBuffer.length,
+      'flow_state': _penFlowState.name,
     });
 
+    // Handle state transitions on new stroke
+    if (_penFlowState == PenFlowState.countdown) {
+      // User is still writing — pause
+      _countdownTimer?.cancel();
+      _onPauseTapped();
+      return;
+    } else if (_penFlowState == PenFlowState.paused) {
+      // Reset the pause timer since user is still writing
+      _pauseTimer?.cancel();
+      _pauseTimer = Timer(
+        const Duration(milliseconds: _pauseDurationMs),
+        _onPauseExpired,
+      );
+      return;
+    } else if (_penFlowState == PenFlowState.sending) {
+      // Strokes added to buffer, will be processed after current send completes
+      return;
+    } else if (_penFlowState == PenFlowState.detecting) {
+      // Detection in progress — buffer stroke, restart debounce for after detection
+      // The stroke is already in _strokeBuffer (line above).
+      // When detection completes, it will check for new buffered strokes.
+      return;
+    }
+
+    // Normal flow: start or reset debounce
     _debounceTimer?.cancel();
+    setState(() => _penFlowState = PenFlowState.debouncing);
     _debounceTimer = Timer(
-      Duration(milliseconds: _debounceMs),
-      _sendClaudeBuffer,
+      const Duration(milliseconds: _debounceMs),
+      _startDetection,
     );
   }
 
-  void _sendClaudeBuffer() {
-    if (_claudeStrokeBuffer.isEmpty) return;
-    DebugService.trace('claude_send_buffer', {'stroke_count': _claudeStrokeBuffer.length});
+  void _startDetection() {
+    // Gather ALL strokes: any previously detected + new buffer
+    final allStrokes = <StrokeObject>[..._detectionStrokes, ..._strokeBuffer];
+    _strokeBuffer.clear();
 
-    final strokes = List<StrokeObject>.from(_claudeStrokeBuffer);
-    _claudeStrokeBuffer.clear();
+    if (allStrokes.isEmpty) {
+      setState(() => _penFlowState = PenFlowState.idle);
+      return;
+    }
 
-    // Find bounding box of all buffered strokes
-    Rect bounds = strokes.first.boundingBox;
-    for (final s in strokes.skip(1)) {
+    // Compute bounds of all strokes
+    Rect bounds = allStrokes.first.boundingBox;
+    for (final s in allStrokes.skip(1)) {
       bounds = bounds.expandToInclude(s.boundingBox);
     }
 
+    // Remove old preview objects if re-detecting
+    for (final obj in _previewObjects) {
+      _objects.remove(obj);
+    }
+    _previewObjects.clear();
+
+    setState(() {
+      _penFlowState = PenFlowState.detecting;
+      _detectionStrokes = allStrokes;
+      _detectionStrokeBounds = bounds;
+    });
+
+    DebugService.trace('detection_start', {'stroke_count': allStrokes.length});
+
+    ChatService.detect(allStrokes).then((regions) {
+      if (!mounted) return;
+      // If new strokes arrived during detection, re-detect with everything
+      if (_strokeBuffer.isNotEmpty) {
+        _startDetection();
+        return;
+      }
+      _showPreview(regions);
+    }).catchError((e) {
+      if (!mounted) return;
+      setState(() => _penFlowState = PenFlowState.idle);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Detection error: $e')),
+      );
+    });
+  }
+
+  void _showPreview(List<DetectedRegion> regions) {
+    DebugService.trace('show_preview', {'region_count': regions.length});
+
+    if (_detectionStrokeBounds == null) {
+      setState(() => _penFlowState = PenFlowState.idle);
+      return;
+    }
+    var bounds = _detectionStrokeBounds!;
+
+    final preview = <CanvasObject>[];
+
+    for (final region in regions) {
+      if (region.type == 'text' && region.content != null && region.content!.isNotEmpty) {
+        preview.add(OcrAnnotationObject(
+          text: region.content!,
+          position: Offset(bounds.left, bounds.top - 18),
+          maxWidth: bounds.width.clamp(200, 600),
+        ));
+      } else if (region.type == 'image' && region.worldBbox != null) {
+        final wb = region.worldBbox!;
+        final imgRect = Rect.fromLTRB(wb[0], wb[1], wb[2], wb[3]);
+        preview.add(ImageBboxObject(
+          worldRect: imgRect,
+          label: 'image',
+        ));
+        // Expand bounds to include image bbox so countdown/response goes below
+        bounds = bounds.expandToInclude(imgRect);
+      }
+    }
+
+    setState(() {
+      _detectedRegions = regions;
+      _previewObjects = preview;
+      _detectionStrokeBounds = bounds;
+      for (final obj in preview) {
+        _objects.add(obj);
+      }
+    });
+
+    _startCountdown();
+  }
+
+  void _startCountdown() {
+    setState(() {
+      _penFlowState = PenFlowState.countdown;
+      _countdownRemaining = _countdownDuration;
+    });
+
+    _countdownTimer?.cancel();
+    _countdownTimer = Timer.periodic(
+      const Duration(milliseconds: 500),
+      (_) {
+        if (!mounted) {
+          _countdownTimer?.cancel();
+          return;
+        }
+        setState(() {
+          _countdownRemaining -= 0.5;
+        });
+        if (_countdownRemaining <= 0) {
+          _countdownTimer?.cancel();
+          _sendToClaude();
+        }
+      },
+    );
+  }
+
+  void _onPauseTapped() {
+    _countdownTimer?.cancel();
+
+    setState(() {
+      _penFlowState = PenFlowState.paused;
+      // Remove preview objects from canvas
+      for (final obj in _previewObjects) {
+        _objects.remove(obj);
+      }
+    });
+
+    _pauseTimer?.cancel();
+    _pauseTimer = Timer(
+      const Duration(milliseconds: _pauseDurationMs),
+      _onPauseExpired,
+    );
+  }
+
+  void _onPauseExpired() {
+    if (!mounted) return;
+
+    // If new strokes were added during pause, run detection on them first
+    if (_strokeBuffer.isNotEmpty) {
+      // Merge new strokes into detection strokes
+      _detectionStrokes.addAll(_strokeBuffer);
+      _strokeBuffer.clear();
+
+      // Recompute bounds
+      Rect bounds = _detectionStrokes.first.boundingBox;
+      for (final s in _detectionStrokes.skip(1)) {
+        bounds = bounds.expandToInclude(s.boundingBox);
+      }
+      _detectionStrokeBounds = bounds;
+
+      // Re-run detection with all strokes
+      setState(() => _penFlowState = PenFlowState.detecting);
+
+      ChatService.detect(_detectionStrokes).then((regions) {
+        if (!mounted) return;
+        _showPreviewForReview(regions);
+      }).catchError((e) {
+        if (!mounted) return;
+        setState(() => _penFlowState = PenFlowState.idle);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Detection error: $e')),
+        );
+      });
+      return;
+    }
+
+    setState(() {
+      _penFlowState = PenFlowState.review;
+      // Re-add preview objects to canvas
+      for (final obj in _previewObjects) {
+        if (!_objects.contains(obj)) {
+          _objects.add(obj);
+        }
+      }
+    });
+  }
+
+  void _showPreviewForReview(List<DetectedRegion> regions) {
+    final bounds = _detectionStrokeBounds;
+    if (bounds == null) {
+      setState(() => _penFlowState = PenFlowState.idle);
+      return;
+    }
+
+    final preview = <CanvasObject>[];
+
+    for (final region in regions) {
+      if (region.type == 'text' && region.content != null && region.content!.isNotEmpty) {
+        preview.add(OcrAnnotationObject(
+          text: region.content!,
+          position: Offset(bounds.left, bounds.top - 18),
+          maxWidth: bounds.width.clamp(200, 600),
+        ));
+      } else if (region.type == 'image' && region.worldBbox != null) {
+        final wb = region.worldBbox!;
+        preview.add(ImageBboxObject(
+          worldRect: Rect.fromLTRB(wb[0], wb[1], wb[2], wb[3]),
+          label: 'image',
+        ));
+      }
+    }
+
+    setState(() {
+      _detectedRegions = regions;
+      _previewObjects = preview;
+      for (final obj in preview) {
+        _objects.add(obj);
+      }
+      _penFlowState = PenFlowState.review;
+    });
+  }
+
+  void _sendToClaude() {
+    if (_detectionStrokes.isEmpty) {
+      setState(() => _penFlowState = PenFlowState.idle);
+      return;
+    }
+
+    final strokes = List<StrokeObject>.from(_detectionStrokes);
+    final regions = List<DetectedRegion>.from(_detectedRegions);
+    final strokeBounds = _detectionStrokeBounds!;
+
+    // Remove preview objects from canvas
+    setState(() {
+      _penFlowState = PenFlowState.sending;
+      for (final obj in _previewObjects) {
+        _objects.remove(obj);
+      }
+      _previewObjects.clear();
+      _detectedRegions = [];
+      _detectionStrokes = [];
+      _detectionStrokeBounds = null;
+    });
+
     // Find or create thread
-    var thread = _findThread(bounds.left, bounds.right);
-    DebugService.trace('send_buffer', {
+    var thread = _findThread(strokeBounds.left, strokeBounds.right);
+    DebugService.trace('send_to_claude', {
       'stroke_count': strokes.length,
-      'bounds': {'l': bounds.left, 't': bounds.top, 'r': bounds.right, 'b': bounds.bottom},
+      'region_count': regions.length,
+      'bounds': {'l': strokeBounds.left, 't': strokeBounds.top, 'r': strokeBounds.right, 'b': strokeBounds.bottom},
       'found_thread': thread?.sessionId,
       'thread_count': _threads.length,
       'threshold': _parallelThreshold,
     });
+
     if (thread == null) {
       thread = ConversationThread(
         sessionId: DateTime.now().microsecondsSinceEpoch.toString(),
-        xCenter: bounds.center.dx,
-        xMin: bounds.left,
-        xMax: bounds.right,
+        xCenter: strokeBounds.center.dx,
+        xMin: strokeBounds.left,
+        xMax: strokeBounds.right,
       );
       _threads.add(thread);
       _threadLabels[thread.sessionId] = _labelForIndex(_nextConversationLabel++);
@@ -274,16 +537,17 @@ class _CanvasScreenState extends State<CanvasScreen> {
 
     // If thread is already waiting, queue strokes back into buffer
     if (thread.isWaitingForResponse) {
-      _claudeStrokeBuffer.addAll(strokes);
-      DebugService.trace('send_buffer_queued', {
+      _strokeBuffer.addAll(strokes);
+      DebugService.trace('send_queued', {
         'reason': 'thread_waiting',
         'stroke_count': strokes.length,
       });
+      setState(() => _penFlowState = PenFlowState.idle);
       return;
     }
 
     // Add thinking indicator below strokes
-    final thinkingPos = Offset(bounds.left, bounds.bottom + 15);
+    final thinkingPos = Offset(strokeBounds.left, strokeBounds.bottom + 15);
     final thinking = ThinkingObject(
       position: thinkingPos,
       sessionId: thread.sessionId,
@@ -293,11 +557,8 @@ class _CanvasScreenState extends State<CanvasScreen> {
       thread!.isWaitingForResponse = true;
     });
 
-    // Start thinking animation
     _startThinkingAnimation(thinking);
-
-    // Fire off the request
-    _doClaudeChat(strokes, thread, thinking, bounds);
+    _doClaudeChat(strokes, thread, thinking, strokeBounds, regions);
   }
 
   void _startThinkingAnimation(ThinkingObject thinking) {
@@ -322,9 +583,9 @@ class _CanvasScreenState extends State<CanvasScreen> {
     ConversationThread thread,
     ThinkingObject thinking,
     Rect strokeBounds,
+    List<DetectedRegion> regions,
   ) async {
     try {
-      // Create the response TextObject immediately — we'll fill it as deltas arrive
       final responseY = thinking.position.dy;
       final convLabel = _threadLabels[thread.sessionId];
       final responseText = TextObject(
@@ -338,7 +599,8 @@ class _CanvasScreenState extends State<CanvasScreen> {
       final response = await ChatService.chatStream(
         strokes,
         sessionId: thread.sessionId,
-        onMetadata: (sessionId, ocrText, regions) {
+        regions: regions.isNotEmpty ? regions : null,
+        onMetadata: (sessionId, ocrText, metaRegions) {
           if (!mounted) return;
           setState(() {
             // Add OCR annotation above the stroke batch
@@ -350,7 +612,7 @@ class _CanvasScreenState extends State<CanvasScreen> {
               ));
             }
             // Add bounding boxes for detected image regions
-            for (final region in regions) {
+            for (final region in metaRegions) {
               if (region.type == 'image' && region.worldBbox != null) {
                 final wb = region.worldBbox!;
                 _objects.add(ImageBboxObject(
@@ -382,7 +644,6 @@ class _CanvasScreenState extends State<CanvasScreen> {
                   obj.translate(Offset(0, heightDelta));
                 }
               }
-              // Compensate canvas if user is writing below
               if (_currentStroke != null &&
                   _currentStroke!.boundingBox.top > responseY - 20) {
                 _offset = _offset - Offset(0, heightDelta * _scale);
@@ -397,7 +658,6 @@ class _CanvasScreenState extends State<CanvasScreen> {
 
       DebugService.trace('claude_response', {'ocr': response.ocrText, 'response_len': response.text.length, 'session': response.sessionId});
       setState(() {
-        // Ensure thinking is removed (in case no deltas arrived)
         if (_objects.contains(thinking)) {
           _objects.remove(thinking);
           _objects.add(responseText);
@@ -406,29 +666,60 @@ class _CanvasScreenState extends State<CanvasScreen> {
         responseText.sessionId = response.sessionId;
         responseText.ocrSource = response.ocrText;
         thread.sessionId = response.sessionId;
+        _penFlowState = PenFlowState.idle;
       });
       // Re-send any strokes that were queued while waiting
-      if (_claudeStrokeBuffer.isNotEmpty) {
-        _sendClaudeBuffer();
+      if (_strokeBuffer.isNotEmpty) {
+        _debounceTimer?.cancel();
+        _debounceTimer = Timer(
+          const Duration(milliseconds: _debounceMs),
+          _startDetection,
+        );
+        setState(() => _penFlowState = PenFlowState.debouncing);
       }
     } catch (e) {
       if (mounted) {
         setState(() {
           _objects.remove(thinking);
           thread.isWaitingForResponse = false;
+          _penFlowState = PenFlowState.idle;
         });
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Claude error: $e')),
         );
-        // Re-send queued strokes even on error
-        if (_claudeStrokeBuffer.isNotEmpty) {
-          _sendClaudeBuffer();
+        if (_strokeBuffer.isNotEmpty) {
+          _debounceTimer?.cancel();
+          _debounceTimer = Timer(
+            const Duration(milliseconds: _debounceMs),
+            _startDetection,
+          );
+          setState(() => _penFlowState = PenFlowState.debouncing);
         }
       }
     }
   }
 
   void _handleTap(Offset world) {
+    // Pen tool: taps create single-point dots (for colons, periods, etc.)
+    if (_activeTool == Tool.pen && _isStylusGesture) {
+      final dot = StrokeObject(points: [
+        PointVector(world.dx, world.dy),
+        PointVector(world.dx + 0.1, world.dy + 0.1),
+      ]);
+      _onPenStrokeComplete(dot);
+      return;
+    }
+
+    // In review state, tapping an OCR annotation opens edit sheet
+    if (_penFlowState == PenFlowState.review) {
+      for (final obj in _previewObjects) {
+        if (obj is OcrAnnotationObject && obj.boundingBox.contains(world)) {
+          _showOcrEditSheet(obj);
+          return;
+        }
+      }
+    }
+
     for (final obj in _objects.reversed) {
       if (obj is TextObject && obj.ocrSource != null && obj.boundingBox.contains(world)) {
         showModalBottomSheet(
@@ -476,6 +767,108 @@ class _CanvasScreenState extends State<CanvasScreen> {
     }
   }
 
+  void _showOcrEditSheet(OcrAnnotationObject annotation) {
+    final controller = TextEditingController(text: annotation.text);
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.white,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(4)),
+        side: BorderSide(color: Color(0xFF1A1A1A), width: 0.5),
+      ),
+      builder: (sheetContext) => Padding(
+        padding: EdgeInsets.only(
+          left: 24,
+          right: 24,
+          top: 24,
+          bottom: MediaQuery.of(sheetContext).viewInsets.bottom + 24,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Edit recognised text',
+              style: TextStyle(
+                fontFamily: 'serif',
+                fontSize: 14,
+                fontWeight: FontWeight.w500,
+                color: Color(0xFF6A6A6A),
+                letterSpacing: 0.5,
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: controller,
+              maxLines: null,
+              autofocus: true,
+              style: const TextStyle(
+                fontFamily: 'serif',
+                fontSize: 18,
+                fontWeight: FontWeight.w400,
+                color: Color(0xFF1A1A1A),
+                height: 1.5,
+              ),
+              decoration: const InputDecoration(
+                border: OutlineInputBorder(
+                  borderSide: BorderSide(color: Color(0xFF1A1A1A), width: 0.5),
+                  borderRadius: BorderRadius.all(Radius.circular(2)),
+                ),
+                enabledBorder: OutlineInputBorder(
+                  borderSide: BorderSide(color: Color(0xFF1A1A1A), width: 0.5),
+                  borderRadius: BorderRadius.all(Radius.circular(2)),
+                ),
+                focusedBorder: OutlineInputBorder(
+                  borderSide: BorderSide(color: Color(0xFF1A1A1A), width: 1.0),
+                  borderRadius: BorderRadius.all(Radius.circular(2)),
+                ),
+                contentPadding: EdgeInsets.all(12),
+              ),
+            ),
+            const SizedBox(height: 16),
+            Align(
+              alignment: Alignment.centerRight,
+              child: GestureDetector(
+                onTap: () {
+                  final newText = controller.text;
+                  setState(() {
+                    annotation.text = newText;
+                    // Update matching DetectedRegion
+                    for (final region in _detectedRegions) {
+                      if (region.type == 'text' && region.content == annotation.text || region.content != newText) {
+                        region.content = newText;
+                        break;
+                      }
+                    }
+                  });
+                  Navigator.of(sheetContext).pop();
+                },
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF1A1A1A),
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                  child: const Text(
+                    'Save',
+                    style: TextStyle(
+                      fontFamily: 'serif',
+                      fontSize: 15,
+                      fontWeight: FontWeight.w500,
+                      color: Colors.white,
+                      letterSpacing: 0.5,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Future<void> _takeScreenshot() async {
     await DebugService.sendScreenshot(_canvasRepaintKey);
     _dumpCanvas();
@@ -494,8 +887,7 @@ class _CanvasScreenState extends State<CanvasScreen> {
 
   void _handleStylusStart(Offset localPoint) {
     final world = _screenToWorld(localPoint);
-    if (_activeTool == Tool.pen || _activeTool == Tool.claude) {
-      // Use points captured before gesture recognizer kicked in
+    if (_activeTool == Tool.pen) {
       final firstPoint = _pointerDownWorld ?? world;
       final points = <PointVector>[
         PointVector(firstPoint.dx, firstPoint.dy),
@@ -511,7 +903,6 @@ class _CanvasScreenState extends State<CanvasScreen> {
       });
     } else if (_activeTool == Tool.select) {
       if (_selectedObjects.isNotEmpty && _selectionBoundingBox != null) {
-        // Check if tapping inside selection → start move
         final padded = _selectionBoundingBox!.inflate(8.0 / _scale);
         if (padded.contains(world)) {
           _isMoving = true;
@@ -529,8 +920,7 @@ class _CanvasScreenState extends State<CanvasScreen> {
 
   void _handleStylusUpdate(Offset localPoint) {
     final world = _screenToWorld(localPoint);
-    if ((_activeTool == Tool.pen || _activeTool == Tool.claude) &&
-        _currentStroke != null) {
+    if (_activeTool == Tool.pen && _currentStroke != null) {
       setState(() {
         _currentStroke = StrokeObject(points: [
           ..._currentStroke!.points,
@@ -555,36 +945,16 @@ class _CanvasScreenState extends State<CanvasScreen> {
   }
 
   bool _isPhantomStroke(StrokeObject stroke) {
-    final bb = stroke.boundingBox;
-    return bb.height > 0 && bb.width / bb.height > 8 && bb.width > 100;
+    // Disabled — was rejecting legitimate horizontal lines and dots.
+    // Phantom EMR strokes are intermittent and filtering causes more harm than good.
+    return false;
   }
 
   void _handleStylusEnd() {
     if (_activeTool == Tool.pen && _currentStroke != null) {
       final stroke = _currentStroke!;
-      final bb = stroke.boundingBox;
-      final isPhantom = _isPhantomStroke(stroke);
-      DebugService.trace('stroke_end', {
-        'tool': 'pen',
-        'points': stroke.points.length,
-        'width': bb.width,
-        'height': bb.height,
-        'ratio': bb.height > 0 ? bb.width / bb.height : 0,
-        'phantom': isPhantom,
-        'first_pt': {'x': stroke.points.first.x, 'y': stroke.points.first.y, 'p': stroke.points.first.pressure},
-        'last_pt': {'x': stroke.points.last.x, 'y': stroke.points.last.y, 'p': stroke.points.last.pressure},
-      });
-      setState(() {
-        if (!isPhantom) {
-          _objects.add(stroke);
-        }
-        _currentStroke = null;
-      });
-    } else if (_activeTool == Tool.claude && _currentStroke != null) {
-      final stroke = _currentStroke!;
       setState(() => _currentStroke = null);
-      DebugService.trace('claude_stroke_end', {'points': stroke.points.length});
-      _onClaudeStrokeComplete(stroke);
+      _onPenStrokeComplete(stroke);
     } else if (_activeTool == Tool.select) {
       if (_isMoving) {
         setState(() {
@@ -624,6 +994,8 @@ class _CanvasScreenState extends State<CanvasScreen> {
   void dispose() {
     _debounceTimer?.cancel();
     _thinkingAnimTimer?.cancel();
+    _countdownTimer?.cancel();
+    _pauseTimer?.cancel();
     super.dispose();
   }
 
@@ -652,15 +1024,6 @@ class _CanvasScreenState extends State<CanvasScreen> {
             selected: _activeTool == Tool.select,
             onTap: () { DebugService.trace('tool_switch', {'tool': 'select'}); setState(() => _activeTool = Tool.select); },
           ),
-          _ToolButton(
-            icon: Icons.auto_awesome_outlined,
-            label: 'Claude',
-            selected: _activeTool == Tool.claude,
-            onTap: () { DebugService.trace('tool_switch', {'tool': 'claude'}); setState(() {
-              _activeTool = Tool.claude;
-              _clearSelection();
-            }); },
-          ),
           const SizedBox(width: 12),
           Builder(builder: (context) {
             if (!SettingsService().debugMode) return const SizedBox.shrink();
@@ -684,7 +1047,7 @@ class _CanvasScreenState extends State<CanvasScreen> {
               await Navigator.of(context).push(
                 MaterialPageRoute(builder: (_) => const SettingsScreen()),
               );
-              setState(() {}); // rebuild to pick up changed settings
+              setState(() {});
             },
           ),
           const SizedBox(width: 4),
@@ -693,7 +1056,7 @@ class _CanvasScreenState extends State<CanvasScreen> {
       body: Stack(
         children: [
           OnyxSdkPenArea(
-            strokeStyle: (_activeTool == Tool.pen || _activeTool == Tool.claude)
+            strokeStyle: _activeTool == Tool.pen
                 ? OnyxStrokeStyle.fountainPen
                 : OnyxStrokeStyle.disabled,
             strokeColor: Colors.black,
@@ -713,7 +1076,6 @@ class _CanvasScreenState extends State<CanvasScreen> {
                 }
               },
               onPointerMove: (event) {
-                // Capture move events before gesture recognizer kicks in
                 if (_isStylusGesture && _currentStroke == null && _pointerDownWorld != null) {
                   _earlyMovePoints.add(_screenToWorld(event.localPosition));
                 }
@@ -783,7 +1145,126 @@ class _CanvasScreenState extends State<CanvasScreen> {
           // Context menu for selection
           if (_selectedObjects.isNotEmpty && _selectionBoundingBox != null)
             _buildContextMenu(),
+          // Countdown bar
+          if (_penFlowState == PenFlowState.countdown && _detectionStrokeBounds != null)
+            _buildCountdownBar(),
+          // Review prompt
+          if (_penFlowState == PenFlowState.review && _detectionStrokeBounds != null)
+            _buildReviewPrompt(),
         ],
+      ),
+    );
+  }
+
+  Widget _buildCountdownBar() {
+    final bounds = _detectionStrokeBounds!;
+    final screenPos = _worldToScreen(Offset(bounds.left, bounds.bottom + 8));
+    final screenWidth = bounds.width * _scale;
+    final barWidth = screenWidth.clamp(160.0, 320.0);
+    final fraction = _countdownRemaining / _countdownDuration;
+
+    return Positioned(
+      left: screenPos.dx,
+      top: screenPos.dy,
+      child: Container(
+        width: barWidth,
+        decoration: BoxDecoration(
+          color: Colors.white,
+          border: Border.all(color: const Color(0xFF1A1A1A), width: 0.5),
+          borderRadius: BorderRadius.circular(2),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  const Text(
+                    'sending to claude',
+                    style: TextStyle(
+                      fontFamily: 'serif',
+                      fontSize: 14,
+                      fontStyle: FontStyle.italic,
+                      fontWeight: FontWeight.w400,
+                      color: Color(0xFF4A4A4A),
+                      letterSpacing: 0.3,
+                    ),
+                  ),
+                  GestureDetector(
+                    onTap: _onPauseTapped,
+                    child: const Icon(
+                      Icons.pause,
+                      size: 18,
+                      color: Color(0xFF4A4A4A),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            Container(
+              height: 3,
+              width: barWidth,
+              color: const Color(0xFFE0E0E0),
+              alignment: Alignment.centerLeft,
+              child: FractionallySizedBox(
+                widthFactor: fraction.clamp(0.0, 1.0),
+                child: Container(
+                  height: 3,
+                  color: const Color(0xFF4A4A4A),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildReviewPrompt() {
+    final bounds = _detectionStrokeBounds!;
+    final screenPos = _worldToScreen(Offset(bounds.left, bounds.bottom + 8));
+    final screenWidth = bounds.width * _scale;
+    final barWidth = screenWidth.clamp(160.0, 320.0);
+
+    return Positioned(
+      left: screenPos.dx,
+      top: screenPos.dy,
+      child: Container(
+        width: barWidth,
+        decoration: BoxDecoration(
+          color: Colors.white,
+          border: Border.all(color: const Color(0xFF1A1A1A), width: 0.5),
+          borderRadius: BorderRadius.circular(2),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Text(
+                'send to claude?',
+                style: TextStyle(
+                  fontFamily: 'serif',
+                  fontSize: 14,
+                  fontStyle: FontStyle.italic,
+                  fontWeight: FontWeight.w400,
+                  color: Color(0xFF4A4A4A),
+                  letterSpacing: 0.3,
+                ),
+              ),
+              GestureDetector(
+                onTap: _sendToClaude,
+                child: const Icon(
+                  Icons.arrow_forward,
+                  size: 18,
+                  color: Color(0xFF4A4A4A),
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -791,6 +1272,43 @@ class _CanvasScreenState extends State<CanvasScreen> {
   Widget _buildContextMenu() {
     final bounds = _selectionBoundingBox!;
     final bottomCenter = _worldToScreen(bounds.bottomCenter);
+
+    final actions = <Widget>[
+      _ContextAction(
+        icon: Icons.text_fields,
+        label: 'To Text',
+        loading: _isOcrLoading,
+        onTap: _isOcrLoading ? null : _ocrSelected,
+      ),
+      _ContextAction(
+        icon: Icons.open_with,
+        label: 'Move',
+        onTap: () {
+          setState(() => _isMoving = true);
+        },
+      ),
+      _ContextAction(
+        icon: Icons.delete_outline,
+        label: 'Delete',
+        onTap: () {
+          setState(() {
+            for (final obj in _selectedObjects) {
+              _objects.remove(obj);
+            }
+            _clearSelection();
+          });
+        },
+      ),
+    ];
+
+    if (_penFlowState == PenFlowState.review) {
+      actions.add(_ContextAction(
+        icon: Icons.auto_awesome,
+        label: 'Send',
+        onTap: _sendToClaude,
+      ));
+    }
+
     return Positioned(
       left: bottomCenter.dx - 80,
       top: bottomCenter.dy + 12,
@@ -803,33 +1321,7 @@ class _CanvasScreenState extends State<CanvasScreen> {
         ),
         child: Row(
           mainAxisSize: MainAxisSize.min,
-          children: [
-            _ContextAction(
-              icon: Icons.text_fields,
-              label: 'To Text',
-              loading: _isOcrLoading,
-              onTap: _isOcrLoading ? null : _ocrSelected,
-            ),
-            _ContextAction(
-              icon: Icons.open_with,
-              label: 'Move',
-              onTap: () {
-                setState(() => _isMoving = true);
-              },
-            ),
-            _ContextAction(
-              icon: Icons.delete_outline,
-              label: 'Delete',
-              onTap: () {
-                setState(() {
-                  for (final obj in _selectedObjects) {
-                    _objects.remove(obj);
-                  }
-                  _clearSelection();
-                });
-              },
-            ),
-          ],
+          children: actions,
         ),
       ),
     );

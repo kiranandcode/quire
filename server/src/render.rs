@@ -25,6 +25,16 @@ impl RenderResult {
             bbox[3] as f64 * self.scale_y + self.min_y - self.margin,
         ]
     }
+
+    /// Convert world-space bbox back to pixel coordinates.
+    pub fn world_to_pixel(&self, world_bbox: &[f64; 4]) -> [u32; 4] {
+        [
+            ((world_bbox[0] - self.min_x + self.margin) / self.scale_x).round() as u32,
+            ((world_bbox[1] - self.min_y + self.margin) / self.scale_y).round() as u32,
+            ((world_bbox[2] - self.min_x + self.margin) / self.scale_x).round() as u32,
+            ((world_bbox[3] - self.min_y + self.margin) / self.scale_y).round() as u32,
+        ]
+    }
 }
 
 /// Render strokes to a white-background RGB image.

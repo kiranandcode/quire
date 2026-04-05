@@ -171,8 +171,24 @@ def run_detect(image_bytes: bytes) -> dict:
             drawing_components.append(unc)
 
     # Step 5: Run OCR for text content
-    ocr_text = _run_model(ocr_model, ocr_processor, img)
-    ocr_text = re.sub(r'\$\\text\{([^}]*)\}\$', r'\1', ocr_text)
+    raw_ocr = _run_model(ocr_model, ocr_processor, img)
+    # If OCR returns LaTeX/SVG, treat the whole thing as an image — the content
+    # is structured/mathematical and Claude should see the drawing directly.
+    has_latex = bool(re.search(r'\\frac|\\begin|\\sum|\\int|\\sqrt|\\matrix|\\align', raw_ocr))
+    has_svg = '<svg' in raw_ocr.lower()
+
+    if has_latex or has_svg:
+        # Entire image is structured content — send as image
+        print(f"[detect] OCR returned LaTeX/SVG, treating as image", flush=True)
+        iw, ih = img.size
+        regions = [{"type": "image", "bbox": [0, 0, iw, ih]}]
+
+        elapsed = time.time() - t
+        print(f"[detect] Done in {elapsed:.1f}s: structured content -> full image",
+              flush=True)
+        return {"regions": regions}
+
+    ocr_text = re.sub(r'\$\\text\{([^}]*)\}\$', r'\1', raw_ocr)
     ocr_text = re.sub(r'^\$|\$$', '', ocr_text).strip()
 
     # Build regions

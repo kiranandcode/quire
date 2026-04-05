@@ -72,12 +72,24 @@ async fn ocr_handler(
 // --- Chat endpoint: OCR strokes → text → Claude → response ---
 
 #[derive(Deserialize)]
+struct PreClassifiedRegion {
+    #[serde(rename = "type")]
+    region_type: String,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    world_bbox: Option<[f64; 4]>,
+}
+
+#[derive(Deserialize)]
 struct ChatRequest {
     strokes: Vec<Vec<StrokePoint>>,
     #[serde(default)]
     session_id: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    regions: Option<Vec<PreClassifiedRegion>>,
 }
 
 #[derive(Serialize)]
@@ -234,25 +246,17 @@ async fn chat_stream_handler(
     // Render strokes to image
     let render = render::strokes_to_image(&req.strokes);
 
-    // Detect text vs image regions
-    let regions = ocr::detect(&render.image, state.ocr_port).await.map_err(|e| {
-        log::log("chat_detect_error", &serde_json::json!({"error": e.to_string()}));
-        e
-    });
-
-    // Build region info for metadata (with world-space bboxes) AND parts for Claude
     let mut region_info: Vec<serde_json::Value> = Vec::new();
 
-    let (parts, ocr_text) = if let Ok(regions) = regions {
+    let (parts, ocr_text) = if let Some(pre_regions) = &req.regions {
+        // Use pre-classified regions from client (user reviewed/modified)
+        log::log("chat_stream_preclassified", &serde_json::json!({
+            "region_count": pre_regions.len(),
+        }));
         let mut parts = Vec::new();
         let mut all_text = String::new();
 
-        log::log("chat_detect_result", &serde_json::json!({
-            "region_count": regions.len(),
-            "regions": regions.iter().map(|r| &r.region_type).collect::<Vec<_>>(),
-        }));
-
-        for region in &regions {
+        for region in pre_regions {
             match region.region_type.as_str() {
                 "text" => {
                     if let Some(ref text) = region.content {
@@ -264,12 +268,15 @@ async fn chat_stream_handler(
                     }
                 }
                 "image" => {
-                    if let Some(bbox) = &region.bbox {
+                    if let Some(ref wb) = region.world_bbox {
                         region_info.push(serde_json::json!({
                             "type": "image",
-                            "world_bbox": render.pixel_to_world(bbox),
+                            "world_bbox": wb,
                         }));
-                        let cropped = render::crop_image(&render.image, bbox[0], bbox[1], bbox[2], bbox[3]);
+                        let pixel_bbox = render.world_to_pixel(wb);
+                        let cropped = render::crop_image(
+                            &render.image, pixel_bbox[0], pixel_bbox[1], pixel_bbox[2], pixel_bbox[3]
+                        );
                         let mut buf = Vec::new();
                         use std::io::Cursor;
                         if cropped.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png).is_ok() {
@@ -291,18 +298,76 @@ async fn chat_stream_handler(
         }
 
         if parts.is_empty() {
-            return Err((StatusCode::BAD_REQUEST, "No content detected".into()));
+            return Err((StatusCode::BAD_REQUEST, "No content in regions".into()));
         }
-
         (parts, all_text.trim().to_string())
     } else {
-        let ocr_text = ocr::recognize(&render.image, state.ocr_port).await.map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("OCR failed: {e}"))
-        })?;
-        if ocr_text.is_empty() {
-            return Err((StatusCode::BAD_REQUEST, "OCR returned empty".into()));
+        // Auto-detect regions (original flow)
+        let regions = ocr::detect(&render.image, state.ocr_port).await.map_err(|e| {
+            log::log("chat_detect_error", &serde_json::json!({"error": e.to_string()}));
+            e
+        });
+
+        if let Ok(regions) = regions {
+            let mut parts = Vec::new();
+            let mut all_text = String::new();
+
+            log::log("chat_detect_result", &serde_json::json!({
+                "region_count": regions.len(),
+                "regions": regions.iter().map(|r| &r.region_type).collect::<Vec<_>>(),
+            }));
+
+            for region in &regions {
+                match region.region_type.as_str() {
+                    "text" => {
+                        if let Some(ref text) = region.content {
+                            if !text.is_empty() {
+                                all_text.push_str(text);
+                                all_text.push(' ');
+                                parts.push(claude::ContentPart::Text(text.clone()));
+                            }
+                        }
+                    }
+                    "image" => {
+                        if let Some(bbox) = &region.bbox {
+                            region_info.push(serde_json::json!({
+                                "type": "image",
+                                "world_bbox": render.pixel_to_world(bbox),
+                            }));
+                            let cropped = render::crop_image(&render.image, bbox[0], bbox[1], bbox[2], bbox[3]);
+                            let mut buf = Vec::new();
+                            use std::io::Cursor;
+                            if cropped.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png).is_ok() {
+                                let b64 = base64::Engine::encode(
+                                    &base64::engine::general_purpose::STANDARD, &buf
+                                );
+                                parts.push(claude::ContentPart::Text(
+                                    "[The user drew a diagram/image here:]".into()
+                                ));
+                                parts.push(claude::ContentPart::ImageBase64 {
+                                    media_type: "image/png".into(),
+                                    data: b64,
+                                });
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if parts.is_empty() {
+                return Err((StatusCode::BAD_REQUEST, "No content detected".into()));
+            }
+            (parts, all_text.trim().to_string())
+        } else {
+            let ocr_text = ocr::recognize(&render.image, state.ocr_port).await.map_err(|e| {
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("OCR failed: {e}"))
+            })?;
+            if ocr_text.is_empty() {
+                return Err((StatusCode::BAD_REQUEST, "OCR returned empty".into()));
+            }
+            (vec![claude::ContentPart::Text(ocr_text.clone())], ocr_text)
         }
-        (vec![claude::ContentPart::Text(ocr_text.clone())], ocr_text)
     };
 
     // Session management
