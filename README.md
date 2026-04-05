@@ -12,27 +12,32 @@ Infinite canvas with an elegant pen-and-paper aesthetic, optimised for e-ink sty
 
 | Tool | Stylus | Touch |
 |------|--------|-------|
-| **Pen** | Draw strokes | Pan / pinch-zoom |
+| **Pen** | Draw strokes → detect → preview → send to Claude | Pan / pinch-zoom |
 | **Select** | Draw selection rectangle / drag to move | Pan / pinch-zoom |
-| **Claude** | Write → debounce (2.5s) → OCR → Claude → streaming response below | Pan / pinch-zoom |
 
-### Claude Pen
+### Pen Flow
 
-Write with the stylus. After a 2.5s pause, strokes are batched and sent to the server. The server renders strokes to an image, runs CRAFT text detection + connected component analysis to separate text from drawings, OCR's the text via LightOnOCR-2-1B, and sends text + any detected drawing images to Claude. The response streams back word-by-word via SSE.
+Write with the stylus. After a 2.5s pause, strokes are sent to the server for detection. The server renders strokes to an image, runs CRAFT text detection + connected component analysis to separate text from drawings, and OCR's the text via LightOnOCR-2-1B. Results appear as canvas annotations (digitised text above handwriting, bounding boxes around detected drawings).
 
-- **Streaming**: responses appear incrementally as Claude generates them
+A **countdown bar** appears below your writing: "sending to claude" with a 5-second timer and a pause button.
+
+- **Auto-send**: if the countdown completes, strokes are sent to Claude automatically
+- **Pause**: press the pause button to stop the countdown. The UI hides for 10 seconds (or while you keep writing). When you stop, a review prompt appears with an explicit send button
+- **Review**: in review state, you can edit the digitised OCR text (tap to edit), reclassify regions, or manually trigger send
+- **Streaming**: Claude's response appears word-by-word as it's generated
 - **Session tracking**: writing near an existing response continues the same conversation
 - **Parallel conversations**: write far enough apart horizontally to start a separate thread
 - **Conversation labels**: each thread gets a letter tag (A, B, C...) shown on responses
-- **Canvas annotations**: OCR'd text shown in light italic above your handwriting; detected drawing regions outlined with a bounding box
 - **Model picker**: choose between Sonnet, Opus, or Haiku in Settings
-- **Phantom stroke filter**: rejects EMR digitizer noise (extremely horizontal strokes)
+- **LaTeX/SVG detection**: mathematical notation (typing rules, equations) is automatically sent as an image so Claude sees the drawing directly
+- **Tap-to-dot**: quick stylus taps register as dots (for colons, periods, punctuation)
 
 ### Selection
 
 Draw a rectangle with the select tool, or drag inside an existing selection to move objects. Context menu:
 
 - **To Text** — OCR selected strokes, replace with text object
+- **Send** — send selected content to Claude (in review state)
 - **Move** — enter move mode for stylus drag
 - **Delete** — remove selected objects
 
@@ -50,19 +55,22 @@ Python OCR Sidecar (LightOnOCR-2-1B + CRAFT, persistent daemon)
 Claude API (Anthropic)
 ```
 
-**Detection pipeline** (per Claude pen request):
+**Detection pipeline** (per pen stroke batch):
 1. Render strokes to image (Rust, `render.rs`)
 2. CRAFT text detection → text region bounding boxes (Python, easyocr)
 3. Connected component analysis on ink pixels (scipy)
 4. Components inside CRAFT boxes or on the same horizontal line → text
 5. Remaining components → drawing/image regions
-6. LightOnOCR-2-1B → OCR text (Python)
-7. Text sent as text to Claude, drawing regions cropped and sent as base64 images
-8. Response streamed back via SSE with metadata (session ID, OCR text, detected regions with world-space bounding boxes)
+6. LightOnOCR-2-1B → OCR text; if output contains LaTeX/SVG → reclassify as image
+7. Results returned to Flutter for preview (OCR annotations + image bboxes)
+8. On send: text sent as text to Claude, drawing regions cropped and sent as base64 images
+9. Response streamed back via SSE; user-reviewed regions skip server-side detection
+
+**Two-phase flow**: detection runs first via `POST /detect`, user reviews, then sends via `POST /chat/stream` with pre-classified regions.
 
 ### Coordinate system
 
-Strokes stored in world space. Transform: `world = (screen - offset) / scale`. The render pipeline tracks coordinate mapping (`RenderResult` struct) so image-space bounding boxes from detection can be converted back to world coordinates for canvas annotations. Early pointer events captured in `Listener.onPointerDown` before gesture recognizer to prevent stroke start clipping.
+Strokes stored in world space. Transform: `world = (screen - offset) / scale`. The render pipeline tracks coordinate mapping (`RenderResult` struct with `pixel_to_world` and `world_to_pixel`) so image-space bounding boxes from detection can be converted between coordinate spaces. Early pointer events captured in `Listener.onPointerDown` before gesture recognizer; stylus taps captured via `onTapUp` for dot/punctuation input.
 
 ## Structure
 
@@ -73,13 +81,13 @@ app/lib/
   models/canvas_object.dart      # StrokeObject, TextObject, ThinkingObject, ConversationThread,
                                  # OcrAnnotationObject, ImageBboxObject
   screens/
-    canvas_screen.dart           # Infinite canvas, tools, selection, Claude pen, annotations
+    canvas_screen.dart           # Infinite canvas, pen flow state machine, preview UI, selection
     settings_screen.dart         # Backend config, model picker, debug toggle
     calibration_screen.dart      # OCR data collection (temporary scaffolding)
   services/
     settings_service.dart        # SharedPreferences persistence (incl. Claude model selection)
     ocr_service.dart             # HTTP client for /ocr
-    chat_service.dart            # SSE streaming client for /chat/stream, fallback /chat
+    chat_service.dart            # SSE streaming client for /chat/stream, detection client for /detect
     debug_service.dart           # Trace logging, screenshots, canvas dumps
 
 server/
@@ -118,11 +126,11 @@ Enable in Settings. The app pushes trace events on every interaction (tool switc
 
 ## TODO
 
-- [ ] Annotations on Claude responses: write near/over responses, local OCR, send as feedback for iteration
+- [ ] OCR annotations as child objects: bound to parent strokes, editable via keyboard, move/delete with parent
+- [ ] Reclassify regions via context menu: mark selection as image/text, re-run detection
+- [ ] Annotations on Claude responses: write near/over responses, send as feedback for iteration
 - [ ] LaTeX/SVG/HTML rendering in responses
-- [ ] Code execution blocks: runnable Python sandbox on server, Run button, stdout/stderr display, draggable
-- [ ] Pre-send grouping preview: show bounding box around pending strokes, auto-partition text vs diagrams, contextual menu to adjust, postpone send until resolved
-- [ ] Prompt buttons: render Claude confirmations as tappable buttons on canvas
+- [ ] Code execution blocks: runnable Python sandbox on server, Run button, stdout/stderr display
 - [ ] Conversation trees: branch conversations with drawn lines between threads
 - [ ] Agentic SDK integration for tool use
 - [ ] Modular/extensible UI architecture

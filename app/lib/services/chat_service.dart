@@ -118,14 +118,15 @@ class ChatService {
         buffer = buffer.substring(pos + 2);
 
         String eventType = '';
-        String data = '';
+        final dataLines = <String>[];
         for (final line in block.split('\n')) {
           if (line.startsWith('event: ')) {
             eventType = line.substring(7);
           } else if (line.startsWith('data: ')) {
-            data = line.substring(6);
+            dataLines.add(line.substring(6));
           }
         }
+        final data = dataLines.join('\n');
 
         switch (eventType) {
           case 'metadata':
