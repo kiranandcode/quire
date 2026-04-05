@@ -148,6 +148,7 @@ class _CanvasScreenState extends State<CanvasScreen> {
     if (_objects.isNotEmpty) {
       setState(() {
         _objects.removeLast();
+        _cleanupOrphanedAnnotations();
         _clearSelection();
       });
     }
@@ -163,8 +164,14 @@ class _CanvasScreenState extends State<CanvasScreen> {
 
   void _selectObjectsInRect(Rect worldRect) {
     _selectedObjects = _objects.where((obj) {
-      return worldRect.overlaps(obj.boundingBox);
+      return obj.isSelectable && worldRect.overlaps(obj.boundingBox);
     }).toList();
+  }
+
+  /// Remove any OcrAnnotationObjects whose parent strokes are all gone.
+  void _cleanupOrphanedAnnotations() {
+    _objects.removeWhere((obj) =>
+      obj is OcrAnnotationObject && obj.isOrphaned(_objects));
   }
 
   Rect? get _selectionBoundingBox {
@@ -343,8 +350,7 @@ class _CanvasScreenState extends State<CanvasScreen> {
       if (region.type == 'text' && region.content != null && region.content!.isNotEmpty) {
         preview.add(OcrAnnotationObject(
           text: region.content!,
-          position: Offset(bounds.left, bounds.top - 18),
-          maxWidth: bounds.width.clamp(200, 600),
+          parentStrokes: List.of(_detectionStrokes),
         ));
       } else if (region.type == 'image' && region.worldBbox != null) {
         final wb = region.worldBbox!;
@@ -469,8 +475,7 @@ class _CanvasScreenState extends State<CanvasScreen> {
       if (region.type == 'text' && region.content != null && region.content!.isNotEmpty) {
         preview.add(OcrAnnotationObject(
           text: region.content!,
-          position: Offset(bounds.left, bounds.top - 18),
-          maxWidth: bounds.width.clamp(200, 600),
+          parentStrokes: List.of(_detectionStrokes),
         ));
       } else if (region.type == 'image' && region.worldBbox != null) {
         final wb = region.worldBbox!;
@@ -607,8 +612,7 @@ class _CanvasScreenState extends State<CanvasScreen> {
             if (ocrText.isNotEmpty) {
               _objects.add(OcrAnnotationObject(
                 text: ocrText,
-                position: Offset(strokeBounds.left, strokeBounds.top - 18),
-                maxWidth: strokeBounds.width.clamp(200, 600),
+                parentStrokes: List.of(_detectionStrokes),
               ));
             }
             // Add bounding boxes for detected image regions
@@ -1295,6 +1299,7 @@ class _CanvasScreenState extends State<CanvasScreen> {
             for (final obj in _selectedObjects) {
               _objects.remove(obj);
             }
+            _cleanupOrphanedAnnotations();
             _clearSelection();
           });
         },
@@ -1567,7 +1572,7 @@ class _CanvasPainter extends CustomPainter {
         letterSpacing: 0.5,
       );
       final lp = TextPainter(
-        text: TextSpan(text: obj.conversationLabel, style: labelStyle),
+        text: TextSpan(text: 'Chat #${obj.conversationLabel}', style: labelStyle),
         textDirection: TextDirection.ltr,
       )..layout();
       lp.paint(canvas, Offset(obj.position.dx + tp.width - lp.width, obj.position.dy - lp.height - 2));
