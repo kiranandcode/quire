@@ -6,9 +6,30 @@ const STROKE_WIDTH: f64 = 3.0;
 const MIN_SIZE: u32 = 128;
 const MAX_SIZE: u32 = 4096;
 
+pub struct RenderResult {
+    pub image: ImageBuffer<Rgb<u8>, Vec<u8>>,
+    pub min_x: f64,
+    pub min_y: f64,
+    pub margin: f64,
+    pub scale_x: f64,
+    pub scale_y: f64,
+}
+
+impl RenderResult {
+    /// Convert pixel-space bbox [x1, y1, x2, y2] to world coordinates.
+    pub fn pixel_to_world(&self, bbox: &[u32; 4]) -> [f64; 4] {
+        [
+            bbox[0] as f64 * self.scale_x + self.min_x - self.margin,
+            bbox[1] as f64 * self.scale_y + self.min_y - self.margin,
+            bbox[2] as f64 * self.scale_x + self.min_x - self.margin,
+            bbox[3] as f64 * self.scale_y + self.min_y - self.margin,
+        ]
+    }
+}
+
 /// Render strokes to a white-background RGB image.
 /// Also saves a debug copy to quire_render_debug.png.
-pub fn strokes_to_image(strokes: &[Vec<StrokePoint>]) -> ImageBuffer<Rgb<u8>, Vec<u8>> {
+pub fn strokes_to_image(strokes: &[Vec<StrokePoint>]) -> RenderResult {
     let mut min_x = f64::MAX;
     let mut min_y = f64::MAX;
     let mut max_x = f64::MIN;
@@ -29,6 +50,9 @@ pub fn strokes_to_image(strokes: &[Vec<StrokePoint>]) -> ImageBuffer<Rgb<u8>, Ve
 
     let width = (raw_w as u32).clamp(MIN_SIZE, MAX_SIZE);
     let height = (raw_h as u32).clamp(MIN_SIZE, MAX_SIZE);
+
+    let scale_x = raw_w / width as f64;
+    let scale_y = raw_h / height as f64;
 
     eprintln!(
         "[render] {} strokes, bbox ({:.0},{:.0})–({:.0},{:.0}), img {}x{}",
@@ -54,7 +78,7 @@ pub fn strokes_to_image(strokes: &[Vec<StrokePoint>]) -> ImageBuffer<Rgb<u8>, Ve
     }
 
     let _ = img.save("quire_render_debug.png");
-    img
+    RenderResult { image: img, min_x, min_y, margin, scale_x, scale_y }
 }
 
 /// Crop a region from an image by pixel coordinates.

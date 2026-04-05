@@ -59,8 +59,8 @@ async fn ocr_handler(
     }
 
     log::log("ocr_request", &serde_json::json!({"stroke_count": req.strokes.len()}));
-    let img = render::strokes_to_image(&req.strokes);
-    let text = ocr::recognize(&img, state.ocr_port).await.map_err(|e| {
+    let render = render::strokes_to_image(&req.strokes);
+    let text = ocr::recognize(&render.image, state.ocr_port).await.map_err(|e| {
         log::log("ocr_error", &serde_json::json!({"error": e.to_string()}));
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
@@ -101,10 +101,10 @@ async fn chat_handler(
     log::log("chat_request", &serde_json::json!({"stroke_count": req.strokes.len(), "session_id": &req.session_id}));
 
     // Render strokes to image
-    let img = render::strokes_to_image(&req.strokes);
+    let render = render::strokes_to_image(&req.strokes);
 
     // Detect text vs image regions via bbox model
-    let regions = ocr::detect(&img, state.ocr_port).await.map_err(|e| {
+    let regions = ocr::detect(&render.image, state.ocr_port).await.map_err(|e| {
         log::log("chat_detect_error", &serde_json::json!({"error": e.to_string()}));
         // Fallback: try pure OCR if detect fails
         e
@@ -136,7 +136,7 @@ async fn chat_handler(
                 "image" => {
                     if let Some(bbox) = &region.bbox {
                         // Crop the image region and encode as base64 PNG
-                        let cropped = render::crop_image(&img, bbox[0], bbox[1], bbox[2], bbox[3]);
+                        let cropped = render::crop_image(&render.image, bbox[0], bbox[1], bbox[2], bbox[3]);
                         let mut buf = Vec::new();
                         use std::io::Cursor;
                         if cropped.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png).is_ok() {
@@ -164,7 +164,7 @@ async fn chat_handler(
         (parts, all_text.trim().to_string())
     } else {
         // Fallback to pure OCR
-        let ocr_text = ocr::recognize(&img, state.ocr_port).await.map_err(|e| {
+        let ocr_text = ocr::recognize(&render.image, state.ocr_port).await.map_err(|e| {
             log::log("chat_ocr_error", &serde_json::json!({"error": e.to_string()}));
             (StatusCode::INTERNAL_SERVER_ERROR, format!("OCR failed: {e}"))
         })?;
@@ -232,17 +232,25 @@ async fn chat_stream_handler(
     log::log("chat_stream_request", &serde_json::json!({"stroke_count": req.strokes.len(), "session_id": &req.session_id}));
 
     // Render strokes to image
-    let img = render::strokes_to_image(&req.strokes);
+    let render = render::strokes_to_image(&req.strokes);
 
     // Detect text vs image regions
-    let regions = ocr::detect(&img, state.ocr_port).await.map_err(|e| {
+    let regions = ocr::detect(&render.image, state.ocr_port).await.map_err(|e| {
         log::log("chat_detect_error", &serde_json::json!({"error": e.to_string()}));
         e
     });
 
+    // Build region info for metadata (with world-space bboxes) AND parts for Claude
+    let mut region_info: Vec<serde_json::Value> = Vec::new();
+
     let (parts, ocr_text) = if let Ok(regions) = regions {
         let mut parts = Vec::new();
         let mut all_text = String::new();
+
+        log::log("chat_detect_result", &serde_json::json!({
+            "region_count": regions.len(),
+            "regions": regions.iter().map(|r| &r.region_type).collect::<Vec<_>>(),
+        }));
 
         for region in &regions {
             match region.region_type.as_str() {
@@ -257,7 +265,11 @@ async fn chat_stream_handler(
                 }
                 "image" => {
                     if let Some(bbox) = &region.bbox {
-                        let cropped = render::crop_image(&img, bbox[0], bbox[1], bbox[2], bbox[3]);
+                        region_info.push(serde_json::json!({
+                            "type": "image",
+                            "world_bbox": render.pixel_to_world(bbox),
+                        }));
+                        let cropped = render::crop_image(&render.image, bbox[0], bbox[1], bbox[2], bbox[3]);
                         let mut buf = Vec::new();
                         use std::io::Cursor;
                         if cropped.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png).is_ok() {
@@ -284,7 +296,7 @@ async fn chat_stream_handler(
 
         (parts, all_text.trim().to_string())
     } else {
-        let ocr_text = ocr::recognize(&img, state.ocr_port).await.map_err(|e| {
+        let ocr_text = ocr::recognize(&render.image, state.ocr_port).await.map_err(|e| {
             (StatusCode::INTERNAL_SERVER_ERROR, format!("OCR failed: {e}"))
         })?;
         if ocr_text.is_empty() {
@@ -308,12 +320,16 @@ async fn chat_stream_handler(
     // Set up streaming channel
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
 
-    // Send initial metadata event with session_id and ocr_text
+    // Send initial metadata event with session_id, ocr_text, and detected regions
     let (sse_tx, sse_rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(64);
 
     let init_event = Event::default()
         .event("metadata")
-        .data(serde_json::json!({"session_id": &session_id, "ocr_text": &ocr_text}).to_string());
+        .data(serde_json::json!({
+            "session_id": &session_id,
+            "ocr_text": &ocr_text,
+            "regions": region_info,
+        }).to_string());
     let _ = sse_tx.send(Ok(init_event)).await;
 
     // Spawn task to forward Claude deltas as SSE events
@@ -438,13 +454,12 @@ async fn detect_handler(
         return Err((StatusCode::BAD_REQUEST, "No strokes".into()));
     }
 
-    let img = render::strokes_to_image(&req.strokes);
-    let regions = ocr::detect(&img, state.ocr_port).await.map_err(|e| {
+    let render = render::strokes_to_image(&req.strokes);
+    let regions = ocr::detect(&render.image, state.ocr_port).await.map_err(|e| {
         eprintln!("Detect error: {e}");
         (StatusCode::INTERNAL_SERVER_ERROR, format!("Detect failed: {e}"))
     })?;
 
-    // Also save the rendered image dimensions for coordinate mapping
     let result = serde_json::json!({
         "regions": regions.iter().map(|r| {
             let mut obj = serde_json::json!({"type": r.region_type});
@@ -453,11 +468,12 @@ async fn detect_handler(
             }
             if let Some(ref bbox) = r.bbox {
                 obj["bbox"] = serde_json::json!(bbox);
+                obj["world_bbox"] = serde_json::json!(render.pixel_to_world(bbox));
             }
             obj
         }).collect::<Vec<_>>(),
-        "image_width": img.width(),
-        "image_height": img.height(),
+        "image_width": render.image.width(),
+        "image_height": render.image.height(),
     });
 
     Ok(Json(result))

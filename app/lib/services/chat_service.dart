@@ -3,6 +3,12 @@ import 'package:http/http.dart' as http;
 import '../models/canvas_object.dart';
 import 'settings_service.dart';
 
+class DetectedRegion {
+  final String type;
+  final List<double>? worldBbox; // [x1, y1, x2, y2] in world coordinates
+  DetectedRegion({required this.type, this.worldBbox});
+}
+
 class ChatResponse {
   final String text;
   final String ocrText;
@@ -57,11 +63,12 @@ class ChatService {
   }
 
   /// Streaming chat. Calls onDelta for each text chunk, onMetadata once
-  /// with session_id/ocr_text, and returns the full ChatResponse when done.
+  /// with session_id/ocr_text/regions, and returns the full ChatResponse when done.
   static Future<ChatResponse> chatStream(
     List<StrokeObject> strokes, {
     String? sessionId,
     required void Function(String delta) onDelta,
+    void Function(String sessionId, String ocrText, List<DetectedRegion> regions)? onMetadata,
   }) async {
     final settings = SettingsService();
     final url = Uri.parse('${settings.backendUrl}/chat/stream');
@@ -124,6 +131,15 @@ class ChatService {
             final meta = jsonDecode(data);
             metaSessionId = meta['session_id'] as String;
             ocrText = meta['ocr_text'] as String;
+            final rawRegions = meta['regions'] as List<dynamic>? ?? [];
+            final regions = rawRegions.map((r) {
+              final wb = r['world_bbox'] as List<dynamic>?;
+              return DetectedRegion(
+                type: r['type'] as String,
+                worldBbox: wb?.map((v) => (v as num).toDouble()).toList(),
+              );
+            }).toList();
+            onMetadata?.call(metaSessionId, ocrText, regions);
             break;
           case 'delta':
             fullText += data;

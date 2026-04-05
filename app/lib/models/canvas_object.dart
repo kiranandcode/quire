@@ -54,6 +54,7 @@ class TextObject extends CanvasObject {
   String? sessionId;
   String? ocrSource;
   bool isUserText;
+  String? conversationLabel;
 
   TextObject({
     required this.text,
@@ -62,6 +63,7 @@ class TextObject extends CanvasObject {
     this.sessionId,
     this.ocrSource,
     this.isUserText = false,
+    this.conversationLabel,
   });
 
   @override
@@ -146,4 +148,66 @@ class ConversationThread {
   bool containsX(double x) {
     return x >= xMin && x <= xMax;
   }
+}
+
+/// Small light text above handwriting showing what OCR digitized.
+class OcrAnnotationObject extends CanvasObject {
+  String text;
+  Offset position;
+  double maxWidth;
+
+  OcrAnnotationObject({
+    required this.text,
+    required this.position,
+    required this.maxWidth,
+  });
+
+  @override
+  Rect get boundingBox {
+    final lines = text.split('\n');
+    const fontSize = 11.0;
+    double w = 0;
+    for (final line in lines) {
+      final lw = line.length * fontSize * 0.5;
+      if (lw > w) w = lw;
+    }
+    w = w.clamp(50, maxWidth);
+    final h = lines.length * fontSize * 1.3;
+    return Rect.fromLTWH(position.dx, position.dy, w, h);
+  }
+
+  @override
+  void translate(Offset delta) {
+    position = position + delta;
+  }
+
+  @override
+  Map<String, dynamic> toJson() => {
+    'type': 'ocr_annotation',
+    'text': text,
+    'position': {'x': position.dx, 'y': position.dy},
+  };
+}
+
+/// Bounding box around a detected image region on the canvas.
+class ImageBboxObject extends CanvasObject {
+  Rect worldRect;
+  String? label;
+
+  ImageBboxObject({required this.worldRect, this.label});
+
+  @override
+  Rect get boundingBox => worldRect;
+
+  @override
+  void translate(Offset delta) {
+    worldRect = worldRect.translate(delta.dx, delta.dy);
+  }
+
+  @override
+  Map<String, dynamic> toJson() => {
+    'type': 'image_bbox',
+    'rect': {'l': worldRect.left, 't': worldRect.top, 'r': worldRect.right, 'b': worldRect.bottom},
+    'label': label,
+  };
 }

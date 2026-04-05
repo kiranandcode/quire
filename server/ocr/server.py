@@ -3,10 +3,10 @@
 
 Endpoints:
   POST /ocr     - OCR only (LightOnOCR-2-1B), returns {"text": "..."}
-  POST /detect  - Layout detection (LightOnOCR-2-1B-bbox), returns {"regions": [...]}
+  POST /detect  - Layout detection (CRAFT + connected components), returns {"regions": [...]}
   GET  /health  - Health check
 
-Both endpoints accept multipart form with 'image' file field.
+Both endpoints accept raw PNG body.
 
 Usage: python3 server.py [--port 8090]
 """
@@ -21,15 +21,16 @@ import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from threading import Lock
 
+import numpy as np
 import torch
 from PIL import Image
+from scipy import ndimage
 from transformers import LightOnOcrForConditionalGeneration, LightOnOcrProcessor
 
 # Globals
 ocr_model = None
 ocr_processor = None
-bbox_model = None
-bbox_processor = None
+craft_reader = None
 model_lock = Lock()
 
 DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
@@ -50,23 +51,19 @@ def load_ocr_model():
     print(f"[ocr] Loaded in {time.time()-t:.1f}s on {DEVICE}", flush=True)
 
 
-def load_bbox_model():
-    global bbox_model, bbox_processor
-    if bbox_model is not None:
+def load_craft():
+    global craft_reader
+    if craft_reader is not None:
         return
-    print("[bbox] Loading LightOnOCR-2-1B-bbox...", flush=True)
+    import easyocr
+    print("[craft] Loading CRAFT text detector...", flush=True)
     t = time.time()
-    bbox_processor = LightOnOcrProcessor.from_pretrained("lightonai/LightOnOCR-2-1B-bbox")
-    bbox_model = LightOnOcrForConditionalGeneration.from_pretrained(
-        "lightonai/LightOnOCR-2-1B-bbox", dtype=DTYPE
-    ).to(DEVICE)
-    bbox_model.eval()
-    print(f"[bbox] Loaded in {time.time()-t:.1f}s on {DEVICE}", flush=True)
+    craft_reader = easyocr.Reader(["en"], gpu=False)
+    print(f"[craft] Loaded in {time.time()-t:.1f}s", flush=True)
 
 
 def _run_model(model, processor, img, max_tokens=512):
     """Run a LightOnOCR model on a PIL image."""
-    # Save image to temp file — LightOnOCR uses file URLs in conversation
     import tempfile
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
         img.save(f, "PNG")
@@ -98,30 +95,103 @@ def run_ocr(image_bytes: bytes) -> str:
 
 
 def run_detect(image_bytes: bytes) -> dict:
-    load_bbox_model()
+    """Detect text vs image regions using CRAFT text detection + connected components.
+
+    1. CRAFT finds text regions (bounding boxes)
+    2. Connected component analysis finds ink blobs
+    3. Components overlapping CRAFT text boxes → text
+    4. Remaining components on the same horizontal line as text → text
+    5. Everything else → drawing/image
+    """
+    load_craft()
+    load_ocr_model()
+
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     w, h = img.size
-    raw = _run_model(bbox_model, bbox_processor, img, max_tokens=2048)
+    print(f"[detect] CRAFT detect: {w}x{h}", flush=True)
+    t = time.time()
 
-    # Parse regions: text lines + image bounding boxes
+    # Step 1: CRAFT text detection
+    MARGIN = 15
+    results = craft_reader.readtext(np.array(img))
+    text_boxes = []
+    for (bbox, _text, _conf) in results:
+        xs = [p[0] for p in bbox]
+        ys = [p[1] for p in bbox]
+        text_boxes.append((min(xs) - MARGIN, min(ys) - MARGIN,
+                           max(xs) + MARGIN, max(ys) + MARGIN))
+
+    # Step 2: Connected component analysis on ink pixels
+    img_gray = np.array(img.convert("L"))
+    ink_mask = img_gray < 128
+    labeled, num_features = ndimage.label(ink_mask)
+
+    components = []
+    for i in range(1, num_features + 1):
+        ys, xs = np.where(labeled == i)
+        if len(xs) < 5:
+            continue
+        cx1, cy1, cx2, cy2 = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+        if (cx2 - cx1) * (cy2 - cy1) < 20:
+            continue
+        y_center = (cy1 + cy2) / 2.0
+        components.append({
+            "bbox": (cx1, cy1, cx2, cy2),
+            "yc": y_center,
+            "pixels": len(xs),
+        })
+
+    # Step 3: Classify components — CRAFT overlap check
+    craft_text = []
+    uncertain = []
+    for comp in components:
+        cx1, cy1, cx2, cy2 = comp["bbox"]
+        comp_area = max((cx2 - cx1) * (cy2 - cy1), 1)
+        max_overlap = 0.0
+        for tx1, ty1, tx2, ty2 in text_boxes:
+            ix1, iy1 = max(cx1, tx1), max(cy1, ty1)
+            ix2, iy2 = min(cx2, tx2), min(cy2, ty2)
+            if ix1 < ix2 and iy1 < iy2:
+                overlap = (ix2 - ix1) * (iy2 - iy1) / comp_area
+                if overlap > max_overlap:
+                    max_overlap = overlap
+        if max_overlap > 0.3:
+            craft_text.append(comp)
+        else:
+            uncertain.append(comp)
+
+    # Step 4: Horizontal line grouping — uncertain components on a text line → text
+    LINE_TOLERANCE = 30
+    drawing_components = []
+    for unc in uncertain:
+        on_text_line = any(
+            abs(unc["yc"] - tc["yc"]) < LINE_TOLERANCE for tc in craft_text
+        )
+        if not on_text_line:
+            drawing_components.append(unc)
+
+    # Step 5: Run OCR for text content
+    ocr_text = _run_model(ocr_model, ocr_processor, img)
+    ocr_text = re.sub(r'\$\\text\{([^}]*)\}\$', r'\1', ocr_text)
+    ocr_text = re.sub(r'^\$|\$$', '', ocr_text).strip()
+
+    # Build regions
     regions = []
-    # Image boxes: [image](image_N.png) x1,y1,x2,y2
-    for m in re.finditer(r'\[image\]\([^)]+\)\s*(\d+),(\d+),(\d+),(\d+)', raw):
-        x1 = int(m.group(1)) * w // 1000
-        y1 = int(m.group(2)) * h // 1000
-        x2 = int(m.group(3)) * w // 1000
-        y2 = int(m.group(4)) * h // 1000
-        regions.append({"type": "image", "bbox": [x1, y1, x2, y2]})
+    if ocr_text:
+        regions.append({"type": "text", "content": ocr_text})
+    if drawing_components:
+        dx1 = min(c["bbox"][0] for c in drawing_components)
+        dy1 = min(c["bbox"][1] for c in drawing_components)
+        dx2 = max(c["bbox"][2] for c in drawing_components)
+        dy2 = max(c["bbox"][3] for c in drawing_components)
+        regions.append({"type": "image", "bbox": [dx1, dy1, dx2, dy2]})
 
-    # Everything else is text
-    text = re.sub(r'\[image\]\([^)]+\)\s*\d+,\d+,\d+,\d+', '', raw).strip()
-    if text:
-        # Clean LaTeX wrappers
-        text = re.sub(r'\$\\text\{([^}]*)\}\$', r'\1', text)
-        text = re.sub(r'^\$|\$$', '', text).strip()
-        regions.insert(0, {"type": "text", "content": text})
+    elapsed = time.time() - t
+    print(f"[detect] Done in {elapsed:.1f}s: {len(text_boxes)} CRAFT boxes, "
+          f"{len(craft_text)} text components, {len(drawing_components)} drawing components",
+          flush=True)
 
-    return {"regions": regions, "raw": raw}
+    return {"regions": regions}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -173,8 +243,10 @@ def main():
 
     if args.preload:
         load_ocr_model()
-        load_bbox_model()
+        load_craft()
 
+    import socket
+    HTTPServer.allow_reuse_address = True
     server = HTTPServer(("127.0.0.1", args.port), Handler)
     print(f"[ocr-sidecar] listening on 127.0.0.1:{args.port}", flush=True)
     server.serve_forever()

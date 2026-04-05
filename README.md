@@ -14,14 +14,19 @@ Infinite canvas with an elegant pen-and-paper aesthetic, optimised for e-ink sty
 |------|--------|-------|
 | **Pen** | Draw strokes | Pan / pinch-zoom |
 | **Select** | Draw selection rectangle / drag to move | Pan / pinch-zoom |
-| **Claude** | Write → debounce (2.5s) → OCR → Claude → response below | Pan / pinch-zoom |
+| **Claude** | Write → debounce (2.5s) → OCR → Claude → streaming response below | Pan / pinch-zoom |
 
 ### Claude Pen
 
-Write with the stylus. After a 2.5s pause, strokes are batched, OCR'd locally via LightOnOCR-2-1B, sent to Claude, and the response is inserted below your handwriting. A thinking indicator (shaking star + rotating words) shows while waiting.
+Write with the stylus. After a 2.5s pause, strokes are batched and sent to the server. The server renders strokes to an image, runs CRAFT text detection + connected component analysis to separate text from drawings, OCR's the text via LightOnOCR-2-1B, and sends text + any detected drawing images to Claude. The response streams back word-by-word via SSE.
 
+- **Streaming**: responses appear incrementally as Claude generates them
 - **Session tracking**: writing near an existing response continues the same conversation
 - **Parallel conversations**: write far enough apart horizontally to start a separate thread
+- **Conversation labels**: each thread gets a letter tag (A, B, C...) shown on responses
+- **Canvas annotations**: OCR'd text shown in light italic above your handwriting; detected drawing regions outlined with a bounding box
+- **Model picker**: choose between Sonnet, Opus, or Haiku in Settings
+- **Phantom stroke filter**: rejects EMR digitizer noise (extremely horizontal strokes)
 
 ### Selection
 
@@ -37,42 +42,53 @@ Tap a Claude response to view the OCR'd source text.
 
 ```
 Flutter App (Boox)
-  ↕ HTTP over USB (adb reverse)
+  ↕ SSE over HTTP/USB (adb reverse)
 Rust Server (axum, :8080)
   ↕ HTTP (:8090)
-Python OCR Sidecar (LightOnOCR-2-1B + bbox variant, persistent daemon)
+Python OCR Sidecar (LightOnOCR-2-1B + CRAFT, persistent daemon)
   ↕ HTTPS
 Claude API (Anthropic)
 ```
 
+**Detection pipeline** (per Claude pen request):
+1. Render strokes to image (Rust, `render.rs`)
+2. CRAFT text detection → text region bounding boxes (Python, easyocr)
+3. Connected component analysis on ink pixels (scipy)
+4. Components inside CRAFT boxes or on the same horizontal line → text
+5. Remaining components → drawing/image regions
+6. LightOnOCR-2-1B → OCR text (Python)
+7. Text sent as text to Claude, drawing regions cropped and sent as base64 images
+8. Response streamed back via SSE with metadata (session ID, OCR text, detected regions with world-space bounding boxes)
+
 ### Coordinate system
 
-Strokes stored in world space. Transform: `world = (screen - offset) / scale`. Early pointer events captured in `Listener.onPointerDown` before gesture recognizer to prevent stroke start clipping.
+Strokes stored in world space. Transform: `world = (screen - offset) / scale`. The render pipeline tracks coordinate mapping (`RenderResult` struct) so image-space bounding boxes from detection can be converted back to world coordinates for canvas annotations. Early pointer events captured in `Listener.onPointerDown` before gesture recognizer to prevent stroke start clipping.
 
 ## Structure
 
 ```
-my_dear_watson/lib/
+app/lib/
   main.dart                      # Entry, init Onyx SDK + settings
   theme/eink_theme.dart          # Serif, thin borders, pen-and-paper aesthetic
-  models/canvas_object.dart      # StrokeObject, TextObject, ThinkingObject, ConversationThread
+  models/canvas_object.dart      # StrokeObject, TextObject, ThinkingObject, ConversationThread,
+                                 # OcrAnnotationObject, ImageBboxObject
   screens/
-    canvas_screen.dart           # Infinite canvas, tools, selection, Claude pen
-    settings_screen.dart         # Backend config, debug toggle, OCR calibration
+    canvas_screen.dart           # Infinite canvas, tools, selection, Claude pen, annotations
+    settings_screen.dart         # Backend config, model picker, debug toggle
     calibration_screen.dart      # OCR data collection (temporary scaffolding)
   services/
-    settings_service.dart        # SharedPreferences persistence
+    settings_service.dart        # SharedPreferences persistence (incl. Claude model selection)
     ocr_service.dart             # HTTP client for /ocr
-    chat_service.dart            # HTTP client for /chat
+    chat_service.dart            # SSE streaming client for /chat/stream, fallback /chat
     debug_service.dart           # Trace logging, screenshots, canvas dumps
 
 server/
-  src/main.rs                    # Axum server: /ocr, /chat, /detect, /debug, /screenshot, /canvas-dump
-  src/ocr.rs                     # LightOnOCR sidecar client
-  src/claude.rs                  # Claude API client
-  src/render.rs                  # Stroke-to-image rendering
+  src/main.rs                    # Axum server: /ocr, /chat, /chat/stream, /detect, /debug, /screenshot, /canvas-dump
+  src/ocr.rs                     # OCR sidecar client (recognize + detect)
+  src/claude.rs                  # Claude API client (sync + streaming)
+  src/render.rs                  # Stroke-to-image rendering with coordinate mapping (RenderResult)
   src/log.rs                     # Structured JSON logging to file
-  ocr/server.py                  # LightOnOCR persistent sidecar daemon
+  ocr/server.py                  # OCR sidecar: LightOnOCR + CRAFT text detection + image region detection
   ocr/requirements.txt           # Python deps
 
 ocr_benchmark/                   # OCR model benchmarking scripts
@@ -89,7 +105,7 @@ python3 ocr/server.py --preload
 cd server && ANTHROPIC_API_KEY=sk-... cargo run --release
 
 # 3. Build and deploy Flutter app
-cd my_dear_watson
+cd app
 flutter build apk --release
 adb install -r build/app/outputs/flutter-apk/app-release.apk
 adb reverse tcp:8080 tcp:8080
@@ -102,14 +118,9 @@ Enable in Settings. The app pushes trace events on every interaction (tool switc
 
 ## TODO
 
-- [ ] Text vs diagram detection: use LightOnOCR-2-1B-bbox to detect image regions, show boxes on UI for user adjustment, auto-send after 2s if unambiguous
-- [ ] Mixed messages to Claude: text regions as text, diagram regions as images
 - [ ] Annotations on Claude responses: write near/over responses, local OCR, send as feedback for iteration
-- [ ] Streaming responses: Claude output appears word by word
-- [ ] Response insertion: shift content without jumping pen position when response arrives mid-writing
 - [ ] LaTeX/SVG/HTML rendering in responses
 - [ ] Code execution blocks: runnable Python sandbox on server, Run button, stdout/stderr display, draggable
-- [ ] Image input: send diagrams/drawings as images to Claude
 - [ ] Pre-send grouping preview: show bounding box around pending strokes, auto-partition text vs diagrams, contextual menu to adjust, postpone send until resolved
 - [ ] Prompt buttons: render Claude confirmations as tappable buttons on canvas
 - [ ] Conversation trees: branch conversations with drawn lines between threads
@@ -122,12 +133,13 @@ Enable in Settings. The app pushes trace events on every interaction (tool switc
 - `perfect_freehand` — pressure-sensitive stroke rendering
 - `onyxsdk_pen` — Boox hardware pen acceleration
 - `shared_preferences` — settings persistence
-- `http` — HTTP client
+- `http` — HTTP client (SSE streaming)
 - `path_provider` — device storage
 
 ### Server
-- `axum` — HTTP server
+- `axum` — HTTP server (incl. SSE)
 - `reqwest` — HTTP client (Claude API, OCR sidecar)
+- `futures` / `tokio-stream` — streaming support
 - `image` — stroke rendering
 - `serde` / `serde_json` — serialization
 - `uuid` — session IDs
@@ -136,4 +148,6 @@ Enable in Settings. The app pushes trace events on every interaction (tool switc
 ### OCR Sidecar
 - `transformers` >= 5.0 — LightOnOCR model
 - `torch` — inference
-- `Pillow` — image processing
+- `easyocr` — CRAFT text detection
+- `scipy` — connected component analysis
+- `Pillow` / `numpy` — image processing

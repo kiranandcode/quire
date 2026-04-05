@@ -74,8 +74,22 @@ class _CanvasScreenState extends State<CanvasScreen> {
   Timer? _thinkingAnimTimer;
   final _random = math.Random();
 
+  // Conversation labels (A, B, C...)
+  int _nextConversationLabel = 0;
+  final Map<String, String> _threadLabels = {};
+
   static const _debounceMs = 2500;
   static const _parallelThresholdFactor = 0.6; // fraction of screen width
+
+  String _labelForIndex(int index) {
+    String label = '';
+    int n = index;
+    do {
+      label = String.fromCharCode(65 + (n % 26)) + label;
+      n = n ~/ 26 - 1;
+    } while (n >= 0);
+    return label;
+  }
 
   Offset _screenToWorld(Offset screen) {
     return (screen - _offset) / _scale;
@@ -102,6 +116,8 @@ class _CanvasScreenState extends State<CanvasScreen> {
       _claudeStrokeBuffer.clear();
       _debounceTimer?.cancel();
       _thinkingAnimTimer?.cancel();
+      _threadLabels.clear();
+      _nextConversationLabel = 0;
     });
   }
 
@@ -253,6 +269,17 @@ class _CanvasScreenState extends State<CanvasScreen> {
         xMax: bounds.right,
       );
       _threads.add(thread);
+      _threadLabels[thread.sessionId] = _labelForIndex(_nextConversationLabel++);
+    }
+
+    // If thread is already waiting, queue strokes back into buffer
+    if (thread.isWaitingForResponse) {
+      _claudeStrokeBuffer.addAll(strokes);
+      DebugService.trace('send_buffer_queued', {
+        'reason': 'thread_waiting',
+        'stroke_count': strokes.length,
+      });
+      return;
     }
 
     // Add thinking indicator below strokes
@@ -299,16 +326,41 @@ class _CanvasScreenState extends State<CanvasScreen> {
     try {
       // Create the response TextObject immediately — we'll fill it as deltas arrive
       final responseY = thinking.position.dy;
+      final convLabel = _threadLabels[thread.sessionId];
       final responseText = TextObject(
         text: '',
         position: Offset(strokeBounds.left, responseY),
         fontSize: 20,
+        conversationLabel: convLabel,
       );
       double lastHeight = 0;
 
       final response = await ChatService.chatStream(
         strokes,
         sessionId: thread.sessionId,
+        onMetadata: (sessionId, ocrText, regions) {
+          if (!mounted) return;
+          setState(() {
+            // Add OCR annotation above the stroke batch
+            if (ocrText.isNotEmpty) {
+              _objects.add(OcrAnnotationObject(
+                text: ocrText,
+                position: Offset(strokeBounds.left, strokeBounds.top - 18),
+                maxWidth: strokeBounds.width.clamp(200, 600),
+              ));
+            }
+            // Add bounding boxes for detected image regions
+            for (final region in regions) {
+              if (region.type == 'image' && region.worldBbox != null) {
+                final wb = region.worldBbox!;
+                _objects.add(ImageBboxObject(
+                  worldRect: Rect.fromLTRB(wb[0], wb[1], wb[2], wb[3]),
+                  label: 'image',
+                ));
+              }
+            }
+          });
+        },
         onDelta: (delta) {
           if (!mounted) return;
           setState(() {
@@ -355,6 +407,10 @@ class _CanvasScreenState extends State<CanvasScreen> {
         responseText.ocrSource = response.ocrText;
         thread.sessionId = response.sessionId;
       });
+      // Re-send any strokes that were queued while waiting
+      if (_claudeStrokeBuffer.isNotEmpty) {
+        _sendClaudeBuffer();
+      }
     } catch (e) {
       if (mounted) {
         setState(() {
@@ -364,6 +420,10 @@ class _CanvasScreenState extends State<CanvasScreen> {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Claude error: $e')),
         );
+        // Re-send queued strokes even on error
+        if (_claudeStrokeBuffer.isNotEmpty) {
+          _sendClaudeBuffer();
+        }
       }
     }
   }
@@ -915,6 +975,10 @@ class _CanvasPainter extends CustomPainter {
         _drawText(canvas, obj);
       } else if (obj is ThinkingObject) {
         _drawThinking(canvas, obj);
+      } else if (obj is OcrAnnotationObject) {
+        _drawOcrAnnotation(canvas, obj);
+      } else if (obj is ImageBboxObject) {
+        _drawImageBbox(canvas, obj);
       }
     }
 
@@ -1000,6 +1064,62 @@ class _CanvasPainter extends CustomPainter {
       textDirection: TextDirection.ltr,
     )..layout(maxWidth: 600);
     tp.paint(canvas, obj.position);
+
+    // Conversation label tag at top-right
+    if (obj.conversationLabel != null) {
+      final labelStyle = TextStyle(
+        color: const Color(0xFF555555),
+        fontSize: 13,
+        fontFamily: 'serif',
+        fontWeight: FontWeight.w500,
+        letterSpacing: 0.5,
+      );
+      final lp = TextPainter(
+        text: TextSpan(text: obj.conversationLabel, style: labelStyle),
+        textDirection: TextDirection.ltr,
+      )..layout();
+      lp.paint(canvas, Offset(obj.position.dx + tp.width - lp.width, obj.position.dy - lp.height - 2));
+    }
+  }
+
+  void _drawOcrAnnotation(Canvas canvas, OcrAnnotationObject obj) {
+    final style = TextStyle(
+      color: const Color(0xFF666666),
+      fontSize: 12,
+      fontFamily: 'serif',
+      fontWeight: FontWeight.w400,
+      fontStyle: FontStyle.italic,
+      height: 1.3,
+      letterSpacing: 0.3,
+    );
+    final tp = TextPainter(
+      text: TextSpan(text: obj.text, style: style),
+      textDirection: TextDirection.ltr,
+    )..layout(maxWidth: obj.maxWidth);
+    tp.paint(canvas, obj.position);
+  }
+
+  void _drawImageBbox(Canvas canvas, ImageBboxObject obj) {
+    final paint = Paint()
+      ..color = const Color(0xFF444444)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.5 / scale;
+    canvas.drawRect(obj.worldRect, paint);
+
+    if (obj.label != null) {
+      final style = TextStyle(
+        color: const Color(0xFF444444),
+        fontSize: 12,
+        fontFamily: 'serif',
+        fontWeight: FontWeight.w400,
+        letterSpacing: 0.3,
+      );
+      final tp = TextPainter(
+        text: TextSpan(text: obj.label, style: style),
+        textDirection: TextDirection.ltr,
+      )..layout();
+      tp.paint(canvas, Offset(obj.worldRect.left + 3, obj.worldRect.top - tp.height - 2));
+    }
   }
 
   void _drawThinking(Canvas canvas, ThinkingObject obj) {
