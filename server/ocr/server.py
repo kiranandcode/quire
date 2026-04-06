@@ -95,117 +95,249 @@ def run_ocr(image_bytes: bytes) -> str:
 
 
 def run_detect(image_bytes: bytes) -> dict:
-    """Detect text vs image regions using CRAFT text detection + connected components.
+    """Detect text vs image regions.
 
-    1. CRAFT finds text regions (bounding boxes)
-    2. Connected component analysis finds ink blobs
-    3. Components overlapping CRAFT text boxes → text
-    4. Remaining components on the same horizontal line as text → text
-    5. Everything else → drawing/image
+    1. CRAFT finds text region bounding boxes
+    2. Group overlapping/nearby CRAFT boxes into clusters
+    3. OCR each cluster with LightOnOCR
+    4. If OCR returns LaTeX → reclassify that cluster as image
+    5. Ink pixels outside all CRAFT boxes → image region
     """
     load_craft()
     load_ocr_model()
 
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     w, h = img.size
-    print(f"[detect] CRAFT detect: {w}x{h}", flush=True)
+    print(f"[detect] {w}x{h}", flush=True)
     t = time.time()
 
     # Step 1: CRAFT text detection
-    MARGIN = 15
+    MARGIN = 10
     results = craft_reader.readtext(np.array(img))
-    text_boxes = []
+    craft_boxes = []
     for (bbox, _text, _conf) in results:
         xs = [p[0] for p in bbox]
         ys = [p[1] for p in bbox]
-        text_boxes.append((min(xs) - MARGIN, min(ys) - MARGIN,
-                           max(xs) + MARGIN, max(ys) + MARGIN))
+        craft_boxes.append([
+            max(0, int(min(xs)) - MARGIN), max(0, int(min(ys)) - MARGIN),
+            min(w, int(max(xs)) + MARGIN), min(h, int(max(ys)) + MARGIN),
+        ])
 
-    # Step 2: Connected component analysis on ink pixels
+    if not craft_boxes:
+        # No text detected — entire image is a drawing
+        img_gray = np.array(img.convert("L"))
+        ink_ys, ink_xs = np.where(img_gray < 128)
+        if len(ink_xs) > 0:
+            return {"regions": [{"type": "image", "bbox": [
+                int(ink_xs.min()), int(ink_ys.min()),
+                int(ink_xs.max()), int(ink_ys.max())
+            ]}]}
+        return {"regions": []}
+
+    # Step 2: Group overlapping/nearby boxes into clusters
+    LINE_GAP = 80  # merge boxes within this vertical distance
+    clusters = []  # each cluster is a list of box indices
+    used = set()
+    for i, box in enumerate(craft_boxes):
+        if i in used:
+            continue
+        cluster = [i]
+        used.add(i)
+        # Find all boxes that overlap or are on same horizontal band
+        changed = True
+        while changed:
+            changed = False
+            for j, other in enumerate(craft_boxes):
+                if j in used:
+                    continue
+                # Check if any box in cluster overlaps or is vertically close
+                for ci in cluster:
+                    cb = craft_boxes[ci]
+                    # Horizontal overlap and vertical proximity
+                    h_overlap = cb[0] < other[2] and other[0] < cb[2]
+                    v_close = abs((cb[1]+cb[3])/2 - (other[1]+other[3])/2) < LINE_GAP
+                    # Or boxes just overlap directly
+                    direct_overlap = (cb[0] < other[2] and other[0] < cb[2] and
+                                     cb[1] < other[3] and other[1] < cb[3])
+                    if direct_overlap or (h_overlap and v_close):
+                        cluster.append(j)
+                        used.add(j)
+                        changed = True
+                        break
+        clusters.append(cluster)
+
+    print(f"[detect] {len(craft_boxes)} CRAFT boxes → {len(clusters)} clusters", flush=True)
+
+    # Step 3: OCR each cluster, reclassify if LaTeX
+    regions = []
+    text_mask = np.zeros((h, w), dtype=bool)  # track which pixels are covered by text
+
+    for ci, cluster_indices in enumerate(clusters):
+        # Compute bounding box of this cluster
+        cx1 = min(craft_boxes[i][0] for i in cluster_indices)
+        cy1 = min(craft_boxes[i][1] for i in cluster_indices)
+        cx2 = max(craft_boxes[i][2] for i in cluster_indices)
+        cy2 = max(craft_boxes[i][3] for i in cluster_indices)
+        pad = 5
+        cx1 = max(0, cx1 - pad)
+        cy1 = max(0, cy1 - pad)
+        cx2 = min(w, cx2 + pad)
+        cy2 = min(h, cy2 + pad)
+
+        # OCR the cluster crop
+        crop = img.crop((cx1, cy1, cx2, cy2))
+        raw_ocr = _run_model(ocr_model, ocr_processor, crop)
+
+        # Check if OCR returned LaTeX/structured content
+        is_latex = bool(re.search(
+            r'\\frac|\\begin|\\sum|\\int|\\sqrt|\\matrix|\\align|'
+            r'\\triangle|\\downarrow|\\uparrow|\\text\{|\\cdot|'
+            r'\\rightarrow|\\leftarrow|\\quad|\\hline|\\end\{',
+            raw_ocr
+        ))
+        is_html = bool(re.search(r'<table|<div|<svg|<tr|<td', raw_ocr, re.IGNORECASE))
+
+        if is_latex or is_html:
+            # Structured content → image; use generous mask padding to capture stray ink
+            img_pad = 40
+            mx1, my1 = max(0, cx1 - img_pad), max(0, cy1 - img_pad)
+            mx2, my2 = min(w, cx2 + img_pad), min(h, cy2 + img_pad)
+            regions.append({"type": "image", "bbox": [mx1, my1, mx2, my2]})
+            text_mask[my1:my2, mx1:mx2] = True
+            print(f"[detect] Cluster {ci}: LaTeX/HTML → image ({mx2-mx1}x{my2-my1})", flush=True)
+        else:
+            # Plain text
+            ocr_text = re.sub(r'\$\\text\{([^}]*)\}\$', r'\1', raw_ocr)
+            ocr_text = re.sub(r'^\$|\$$', '', ocr_text).strip()
+
+            # Detect garbled/hallucinated OCR: repeated patterns → treat as image
+            is_garbled = False
+            if len(ocr_text) > 100:
+                # Check for repeated substrings (hallucination)
+                for plen in range(5, 30):
+                    pattern = ocr_text[:plen]
+                    if ocr_text.count(pattern) > 3:
+                        is_garbled = True
+                        break
+
+            if is_garbled:
+                regions.append({"type": "image", "bbox": [cx1, cy1, cx2, cy2]})
+                text_mask[cy1:cy2, cx1:cx2] = True
+                print(f"[detect] Cluster {ci}: garbled → image ({cx2-cx1}x{cy2-cy1})", flush=True)
+            elif ocr_text:
+                if len(ocr_text) > 200:
+                    ocr_text = ocr_text[:200]
+                regions.append({"type": "text", "content": ocr_text, "_cluster_bbox": [cx1, cy1, cx2, cy2]})
+                print(f"[detect] Cluster {ci}: text ({cx2-cx1}x{cy2-cy1}): {repr(ocr_text[:60])}", flush=True)
+            # Mark text cluster pixels as covered
+            text_mask[cy1:cy2, cx1:cx2] = True
+
+    # Step 4: Find drawing regions — ink pixels NOT covered by any CRAFT cluster
     img_gray = np.array(img.convert("L"))
     ink_mask = img_gray < 128
-    labeled, num_features = ndimage.label(ink_mask)
+    drawing_mask = ink_mask & ~text_mask
+    drawing_ys, drawing_xs = np.where(drawing_mask)
 
-    components = []
-    for i in range(1, num_features + 1):
-        ys, xs = np.where(labeled == i)
-        if len(xs) < 5:
-            continue
-        cx1, cy1, cx2, cy2 = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
-        if (cx2 - cx1) * (cy2 - cy1) < 20:
-            continue
-        y_center = (cy1 + cy2) / 2.0
-        components.append({
-            "bbox": (cx1, cy1, cx2, cy2),
-            "yc": y_center,
-            "pixels": len(xs),
-        })
-
-    # Step 3: Classify components — CRAFT overlap check
-    craft_text = []
-    uncertain = []
-    for comp in components:
-        cx1, cy1, cx2, cy2 = comp["bbox"]
-        comp_area = max((cx2 - cx1) * (cy2 - cy1), 1)
-        max_overlap = 0.0
-        for tx1, ty1, tx2, ty2 in text_boxes:
-            ix1, iy1 = max(cx1, tx1), max(cy1, ty1)
-            ix2, iy2 = min(cx2, tx2), min(cy2, ty2)
-            if ix1 < ix2 and iy1 < iy2:
-                overlap = (ix2 - ix1) * (iy2 - iy1) / comp_area
-                if overlap > max_overlap:
-                    max_overlap = overlap
-        if max_overlap > 0.3:
-            craft_text.append(comp)
-        else:
-            uncertain.append(comp)
-
-    # Step 4: Horizontal line grouping — uncertain components on a text line → text
-    LINE_TOLERANCE = 30
-    drawing_components = []
-    for unc in uncertain:
-        on_text_line = any(
-            abs(unc["yc"] - tc["yc"]) < LINE_TOLERANCE for tc in craft_text
-        )
-        if not on_text_line:
-            drawing_components.append(unc)
-
-    # Step 5: Run OCR for text content
-    raw_ocr = _run_model(ocr_model, ocr_processor, img)
-    # If OCR returns LaTeX/SVG, treat the whole thing as an image — the content
-    # is structured/mathematical and Claude should see the drawing directly.
-    has_latex = bool(re.search(r'\\frac|\\begin|\\sum|\\int|\\sqrt|\\matrix|\\align', raw_ocr))
-    has_svg = '<svg' in raw_ocr.lower()
-
-    if has_latex or has_svg:
-        # Entire image is structured content — send as image
-        print(f"[detect] OCR returned LaTeX/SVG, treating as image", flush=True)
-        iw, ih = img.size
-        regions = [{"type": "image", "bbox": [0, 0, iw, ih]}]
-
-        elapsed = time.time() - t
-        print(f"[detect] Done in {elapsed:.1f}s: structured content -> full image",
-              flush=True)
-        return {"regions": regions}
-
-    ocr_text = re.sub(r'\$\\text\{([^}]*)\}\$', r'\1', raw_ocr)
-    ocr_text = re.sub(r'^\$|\$$', '', ocr_text).strip()
-
-    # Build regions
-    regions = []
-    if ocr_text:
-        regions.append({"type": "text", "content": ocr_text})
-    if drawing_components:
-        dx1 = min(c["bbox"][0] for c in drawing_components)
-        dy1 = min(c["bbox"][1] for c in drawing_components)
-        dx2 = max(c["bbox"][2] for c in drawing_components)
-        dy2 = max(c["bbox"][3] for c in drawing_components)
+    if len(drawing_xs) > 50:  # minimum ink pixels for a drawing
+        dx1, dy1 = int(drawing_xs.min()), int(drawing_ys.min())
+        dx2, dy2 = int(drawing_xs.max()), int(drawing_ys.max())
         regions.append({"type": "image", "bbox": [dx1, dy1, dx2, dy2]})
+        print(f"[detect] Drawing region: ({dx2-dx1}x{dy2-dy1}) from uncovered ink", flush=True)
+
+    # Step 5: Merge overlapping/nearby image regions
+    MERGE_GAP = 30
+    merged = True
+    while merged:
+        merged = False
+        image_regions = [r for r in regions if r["type"] == "image" and "bbox" in r]
+        for i in range(len(image_regions)):
+            for j in range(i + 1, len(image_regions)):
+                a, b = image_regions[i]["bbox"], image_regions[j]["bbox"]
+                h_close = a[0] < b[2] + MERGE_GAP and b[0] < a[2] + MERGE_GAP
+                v_close = a[1] < b[3] + MERGE_GAP and b[1] < a[3] + MERGE_GAP
+                if h_close and v_close:
+                    image_regions[i]["bbox"] = [
+                        min(a[0], b[0]), min(a[1], b[1]),
+                        max(a[2], b[2]), max(a[3], b[3]),
+                    ]
+                    regions.remove(image_regions[j])
+                    merged = True
+                    break
+            if merged:
+                break
+
+    # Step 6: Viral image absorption — text inside/overlapping drawing ink
+    # becomes part of the image. Check if drawing ink surrounds the text
+    # on 3+ sides (left/right/above/below). This catches labels inside diagrams
+    # while leaving standalone text (like "Please convert to LATEX") alone.
+    drawing_mask = ink_mask & ~text_mask  # non-text ink pixels
+    absorbed = True
+    while absorbed:
+        absorbed = False
+        image_regions = [r for r in regions if r["type"] == "image" and "bbox" in r]
+        text_regions = [r for r in regions if r["type"] == "text"]
+        if not image_regions:
+            break
+        for tr in text_regions:
+            tr_bbox = tr.get("_cluster_bbox")
+            if tr_bbox is None:
+                continue
+            tx1, ty1, tx2, ty2 = tr_bbox
+            # Check how many sides have drawing ink nearby (within 20px margin)
+            margin = 20
+            sides = 0
+            # Left: ink in a strip to the left of the text
+            left_strip = drawing_mask[max(0,ty1):ty2, max(0,tx1-margin):tx1]
+            if left_strip.any():
+                sides += 1
+            # Right: ink to the right
+            right_strip = drawing_mask[max(0,ty1):ty2, tx2:min(w,tx2+margin)]
+            if right_strip.any():
+                sides += 1
+            # Above: ink above
+            above_strip = drawing_mask[max(0,ty1-margin):ty1, max(0,tx1):tx2]
+            if above_strip.any():
+                sides += 1
+            # Below: ink below
+            below_strip = drawing_mask[ty2:min(h,ty2+margin), max(0,tx1):tx2]
+            if below_strip.any():
+                sides += 1
+
+            if sides >= 3:
+                # Absorb into the nearest/overlapping image region
+                best_ir = None
+                best_dist = float('inf')
+                tcx, tcy = (tx1+tx2)/2, (ty1+ty2)/2
+                for ir in image_regions:
+                    ib = ir["bbox"]
+                    icx, icy = (ib[0]+ib[2])/2, (ib[1]+ib[3])/2
+                    dist = abs(tcx-icx) + abs(tcy-icy)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_ir = ir
+                if best_ir:
+                    ib = best_ir["bbox"]
+                    best_ir["bbox"] = [
+                        min(ib[0], tx1), min(ib[1], ty1),
+                        max(ib[2], tx2), max(ib[3], ty2),
+                    ]
+                    regions.remove(tr)
+                    absorbed = True
+                    print(f"[detect] Absorbed text ({sides}/4 sides with ink): "
+                          f"{repr(tr.get('content', '')[:40])}", flush=True)
+                    break
+
+    img_count = sum(1 for r in regions if r["type"] == "image")
+    if img_count > 0:
+        print(f"[detect] Final: {img_count} image region(s)", flush=True)
+
+    # Strip internal fields before returning
+    for r in regions:
+        r.pop("_cluster_bbox", None)
 
     elapsed = time.time() - t
-    print(f"[detect] Done in {elapsed:.1f}s: {len(text_boxes)} CRAFT boxes, "
-          f"{len(craft_text)} text components, {len(drawing_components)} drawing components",
-          flush=True)
+    print(f"[detect] Done in {elapsed:.1f}s: {len(craft_boxes)} CRAFT boxes, "
+          f"{len(clusters)} clusters, {len(regions)} regions", flush=True)
 
     return {"regions": regions}
 

@@ -82,6 +82,14 @@ struct PreClassifiedRegion {
 }
 
 #[derive(Deserialize)]
+struct AnnotationContext {
+    #[serde(default)]
+    original_response: Option<String>,
+    #[serde(default)]
+    original_image_b64: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct ChatRequest {
     strokes: Vec<Vec<StrokePoint>>,
     #[serde(default)]
@@ -90,6 +98,8 @@ struct ChatRequest {
     model: Option<String>,
     #[serde(default)]
     regions: Option<Vec<PreClassifiedRegion>>,
+    #[serde(default)]
+    annotation_context: Option<AnnotationContext>,
 }
 
 #[derive(Serialize)]
@@ -248,7 +258,7 @@ async fn chat_stream_handler(
 
     let mut region_info: Vec<serde_json::Value> = Vec::new();
 
-    let (parts, ocr_text) = if let Some(pre_regions) = &req.regions {
+    let (mut parts, ocr_text) = if let Some(pre_regions) = &req.regions {
         // Use pre-classified regions from client (user reviewed/modified)
         log::log("chat_stream_preclassified", &serde_json::json!({
             "region_count": pre_regions.len(),
@@ -380,12 +390,57 @@ async fn chat_stream_handler(
         sessions.get(&session_id).cloned().unwrap_or_default()
     };
 
+    // Prepend annotation context if present
+    if let Some(ref ctx) = req.annotation_context {
+        let mut annotation_parts = Vec::new();
+
+        if let Some(ref original) = ctx.original_response {
+            annotation_parts.push(claude::ContentPart::Text(format!(
+                "[The user is annotating your previous response. They drew on or near it with their stylus to give feedback.]\n\n\
+                 Your previous response:\n\"\"\"\n{}\n\"\"\"",
+                original
+            )));
+        }
+
+        if let Some(ref img_b64) = ctx.original_image_b64 {
+            annotation_parts.push(claude::ContentPart::Text(
+                "[The user annotated your previously rendered diagram (shown below).]".into()
+            ));
+            annotation_parts.push(claude::ContentPart::ImageBase64 {
+                media_type: "image/png".into(),
+                data: img_b64.clone(),
+            });
+        }
+
+        annotation_parts.push(claude::ContentPart::Text(
+            "The user's annotation (handwriting image + OCR text):".into()
+        ));
+        // Always include the full rendered strokes image so arrows/drawings aren't lost
+        {
+            let mut buf = Vec::new();
+            use std::io::Cursor;
+            if render.image.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png).is_ok() {
+                let b64 = base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD, &buf
+                );
+                annotation_parts.push(claude::ContentPart::ImageBase64 {
+                    media_type: "image/png".into(),
+                    data: b64,
+                });
+            }
+        }
+        annotation_parts.extend(parts);
+        parts = annotation_parts;
+
+        log::log("annotation_send", &serde_json::json!({
+            "has_original_response": ctx.original_response.is_some(),
+            "has_original_image": ctx.original_image_b64.is_some(),
+        }));
+    }
+
     let user_msg = claude::build_multipart_message(&parts);
 
-    // Set up streaming channel
-    let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
-
-    // Send initial metadata event with session_id, ocr_text, and detected regions
+    // SSE output channel
     let (sse_tx, sse_rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(64);
 
     let init_event = Event::default()
@@ -397,31 +452,26 @@ async fn chat_stream_handler(
         }).to_string());
     let _ = sse_tx.send(Ok(init_event)).await;
 
-    // Spawn task to forward Claude deltas as SSE events
-    let sse_tx_clone = sse_tx.clone();
-    tokio::spawn(async move {
-        let mut rx = rx;
-        while let Some(delta) = rx.recv().await {
-            let event = Event::default().event("delta").data(delta);
-            if sse_tx_clone.send(Ok(event)).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    // Spawn task to call Claude and handle completion
+    // Spawn task to call Claude with tool use loop
     let api_key = state.anthropic_key.clone();
     let model = req.model.as_deref().unwrap_or(claude::DEFAULT_MODEL).to_string();
     let session_id_clone = session_id.clone();
     let ocr_text_clone = ocr_text.clone();
     let state_clone = state.clone();
     tokio::spawn(async move {
-        match claude::chat_mixed_stream(&api_key, &history, user_msg, &model, tx).await {
+        let result = run_claude_with_tools(
+            &api_key,
+            &history,
+            user_msg,
+            &model,
+            &sse_tx,
+        ).await;
+
+        match result {
             Ok(full_text) => {
                 log::log("chat_stream_response", &serde_json::json!({
                     "text": &full_text, "session_id": &session_id_clone
                 }));
-                // Store in session history
                 let mut sessions = state_clone.sessions.lock().await;
                 let hist = sessions.entry(session_id_clone).or_default();
                 hist.push(ClaudeMessage {
@@ -443,6 +493,181 @@ async fn chat_stream_handler(
 
     let stream = ReceiverStream::new(sse_rx);
     Ok(Sse::new(stream))
+}
+
+// --- Claude tool use loop ---
+
+const SYSTEM_PROMPT: &str = "\
+You are an AI assistant on an e-ink tablet. The user writes with a stylus and you see their handwriting via OCR text and/or images of their drawings.
+
+IMPORTANT: When you need to show any mathematical notation, equations, typing rules, diagrams, plots, or structured visual content, you MUST use the render_diagram tool. Never include LaTeX, SVG, or code blocks containing visual/mathematical content inline in your text response. Your text should only contain prose — all visual content goes through render_diagram.
+
+Keep responses concise — this is an e-ink display with limited space.";
+
+fn render_diagram_tool() -> serde_json::Value {
+    serde_json::json!({
+        "name": "render_diagram",
+        "description": "Render LaTeX or SVG content as a PNG image displayed on the user's e-ink canvas. Use this for ALL mathematical notation, equations, typing rules, diagrams, plots, tikz pictures, or any structured visual content. Never include such content inline as text.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": ["latex", "svg"],
+                    "description": "The content type to render"
+                },
+                "content": {
+                    "type": "string",
+                    "description": "The LaTeX or SVG content. For LaTeX: provide the body only (no \\documentclass or \\begin{document}). Packages amsmath, amssymb, mathtools, tikz, pgfplots, bussproofs are available."
+                }
+            },
+            "required": ["type", "content"]
+        }
+    })
+}
+
+/// Execute a render_diagram tool call. Returns PNG bytes.
+fn execute_render_tool(input: &serde_json::Value) -> Result<Vec<u8>, String> {
+    let render_type = input["type"].as_str().unwrap_or("latex");
+    let content = input["content"].as_str().unwrap_or("");
+
+    match render_type {
+        "latex" => render::render_latex(content),
+        "svg" => render::render_svg(content),
+        _ => Err(format!("Unknown render type: {render_type}")),
+    }
+}
+
+/// Run Claude with the render_diagram tool, handling the tool use loop.
+async fn run_claude_with_tools(
+    api_key: &str,
+    history: &[ClaudeMessage],
+    user_msg: claude::ClaudeRawMessage,
+    model: &str,
+    sse_tx: &tokio::sync::mpsc::Sender<Result<Event, std::convert::Infallible>>,
+) -> Result<String, String> {
+    let tools = vec![render_diagram_tool()];
+    let (text_tx, mut text_rx) = tokio::sync::mpsc::channel::<String>(64);
+
+    // Forward text deltas to SSE
+    let sse_fwd = sse_tx.clone();
+    let fwd_task = tokio::spawn(async move {
+        while let Some(delta) = text_rx.recv().await {
+            let event = Event::default().event("delta").data(delta);
+            if sse_fwd.send(Ok(event)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Build initial messages
+    let mut messages: Vec<claude::ClaudeRawMessage> =
+        history.iter().map(|m| m.to_raw()).collect();
+    messages.push(user_msg);
+
+    let mut full_text = String::new();
+
+    // Tool use loop (max 5 rounds to prevent infinite loops)
+    for round in 0..5 {
+        let result = claude::stream_request(
+            api_key,
+            messages.clone(),
+            model,
+            Some(SYSTEM_PROMPT),
+            Some(&tools),
+            &text_tx,
+        ).await?;
+
+        full_text.push_str(&result.text);
+
+        if result.tool_calls.is_empty() {
+            break;
+        }
+
+        log::log("tool_use_round", &serde_json::json!({
+            "round": round,
+            "tool_calls": result.tool_calls.len(),
+        }));
+
+        // Build assistant message with all content blocks
+        messages.push(claude::ClaudeRawMessage {
+            role: "assistant".into(),
+            content: serde_json::Value::Array(result.assistant_blocks),
+        });
+
+        // Execute each tool call and build tool results
+        let mut tool_results = Vec::new();
+        for tc in &result.tool_calls {
+            if tc.name == "render_diagram" {
+                log::log("render_tool_call", &serde_json::json!({
+                    "type": tc.input["type"],
+                    "content_len": tc.input["content"].as_str().map(|s| s.len()),
+                }));
+
+                match tokio::task::spawn_blocking({
+                    let input = tc.input.clone();
+                    move || execute_render_tool(&input)
+                }).await {
+                    Ok(Ok(png_bytes)) => {
+                        log::log("render_tool_success", &serde_json::json!({
+                            "png_bytes": png_bytes.len(),
+                        }));
+
+                        // Send image to client via SSE
+                        let b64 = base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD, &png_bytes
+                        );
+                        let _ = sse_tx.send(Ok(
+                            Event::default().event("image").data(b64)
+                        )).await;
+
+                        tool_results.push(serde_json::json!({
+                            "type": "tool_result",
+                            "tool_use_id": tc.id,
+                            "content": "Image rendered and displayed to user successfully."
+                        }));
+                    }
+                    Ok(Err(e)) => {
+                        log::log("render_tool_error", &serde_json::json!({"error": &e}));
+
+                        // Notify client about the error (truncate for display)
+                        let snippet = if e.len() > 120 { &e[..120] } else { &e };
+                        let _ = sse_tx.send(Ok(
+                            Event::default().event("render_error").data(
+                                serde_json::json!({"error": snippet, "round": round}).to_string()
+                            )
+                        )).await;
+
+                        tool_results.push(serde_json::json!({
+                            "type": "tool_result",
+                            "tool_use_id": tc.id,
+                            "is_error": true,
+                            "content": format!("Render failed: {e}")
+                        }));
+                    }
+                    Err(e) => {
+                        tool_results.push(serde_json::json!({
+                            "type": "tool_result",
+                            "tool_use_id": tc.id,
+                            "is_error": true,
+                            "content": format!("Spawn error: {e}")
+                        }));
+                    }
+                }
+            }
+        }
+
+        // Add tool results as user message
+        messages.push(claude::ClaudeRawMessage {
+            role: "user".into(),
+            content: serde_json::Value::Array(tool_results),
+        });
+    }
+
+    drop(text_tx);
+    let _ = fwd_task.await;
+
+    Ok(full_text)
 }
 
 // --- Auth ---
@@ -499,6 +724,42 @@ async fn canvas_dump_handler(Json(payload): Json<serde_json::Value>) -> StatusCo
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }
+}
+
+// --- Render endpoint (LaTeX/SVG → PNG) ---
+
+#[derive(Deserialize)]
+struct RenderRequest {
+    #[serde(rename = "type")]
+    render_type: String,
+    content: String,
+}
+
+async fn render_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<RenderRequest>,
+) -> Result<Bytes, (StatusCode, String)> {
+    check_auth(&state, &headers).map_err(|s| (s, "Unauthorized".into()))?;
+
+    log::log("render_request", &serde_json::json!({"type": &req.render_type, "content_len": req.content.len()}));
+
+    let png_bytes = match req.render_type.as_str() {
+        "latex" => tokio::task::spawn_blocking(move || render::render_latex(&req.content))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn: {e}")))?,
+        "svg" => tokio::task::spawn_blocking(move || render::render_svg(&req.content))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn: {e}")))?,
+        _ => Err(format!("Unknown render type: {}", req.render_type)),
+    }
+    .map_err(|e| {
+        log::log("render_error", &serde_json::json!({"error": &e}));
+        (StatusCode::INTERNAL_SERVER_ERROR, e)
+    })?;
+
+    log::log("render_success", &serde_json::json!({"type": &req.render_type, "png_bytes": png_bytes.len()}));
+    Ok(Bytes::from(png_bytes))
 }
 
 // --- Detect endpoint ---
@@ -577,6 +838,7 @@ async fn main() {
         .route("/chat", post(chat_handler))
         .route("/chat/stream", post(chat_stream_handler))
         .route("/detect", post(detect_handler))
+        .route("/render", post(render_handler))
         .route("/debug", post(debug_handler))
         .route("/screenshot", post(screenshot_handler))
         .route("/canvas-dump", post(canvas_dump_handler))

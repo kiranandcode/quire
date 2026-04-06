@@ -10,3 +10,4 @@ export 'objects/thinking.dart';
 export 'objects/ocr_annotation.dart';
 export 'objects/image_bbox.dart';
 export 'objects/conversation_thread.dart';
+export 'objects/diagram.dart';

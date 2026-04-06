@@ -20,17 +20,21 @@ class TextObject extends CanvasObject {
     this.conversationLabel,
   });
 
+  static const double maxLineWidth = 600.0;
+
   @override
   Rect get boundingBox {
     final lines = text.split('\n');
-    double maxWidth = 0;
+    final charWidth = fontSize * 0.55;
+    double totalHeight = 0;
     for (final line in lines) {
-      final w = line.length * fontSize * 0.55;
-      if (w > maxWidth) maxWidth = w;
+      final lineWidth = line.length * charWidth;
+      final wrappedLines = lineWidth > maxLineWidth
+          ? (lineWidth / maxLineWidth).ceil()
+          : 1;
+      totalHeight += wrappedLines * fontSize * 1.6;
     }
-    maxWidth = maxWidth.clamp(50, double.infinity);
-    final height = lines.length * fontSize * 1.4;
-    return Rect.fromLTWH(position.dx, position.dy, maxWidth, height);
+    return Rect.fromLTWH(position.dx, position.dy, maxLineWidth, totalHeight);
   }
 
   @override

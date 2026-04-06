@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 import '../models/canvas_object.dart';
 import 'settings_service.dart';
@@ -40,26 +41,33 @@ class ChatService {
       return s.points.map((p) => {'x': p.x, 'y': p.y, 'p': p.pressure}).toList();
     }).toList();
 
-    final response = await http.post(
-      url,
-      headers: headers,
-      body: jsonEncode({'strokes': payload}),
-    );
-
-    if (response.statusCode != 200) {
-      throw Exception('Detect failed: ${response.statusCode} ${response.body}');
-    }
-
-    final data = jsonDecode(response.body);
-    final rawRegions = data['regions'] as List<dynamic>? ?? [];
-    return rawRegions.map((r) {
-      final wb = r['world_bbox'] as List<dynamic>?;
-      return DetectedRegion(
-        type: r['type'] as String,
-        content: r['content'] as String?,
-        worldBbox: wb?.map((v) => (v as num).toDouble()).toList(),
+    final client = http.Client();
+    try {
+      final request = http.Request('POST', url);
+      request.headers.addAll(headers);
+      request.body = jsonEncode({'strokes': payload});
+      final streamedResponse = await client.send(request).timeout(
+        const Duration(seconds: 60),
       );
-    }).toList();
+      final responseBody = await streamedResponse.stream.bytesToString();
+
+      if (streamedResponse.statusCode != 200) {
+        throw Exception('Detect failed: ${streamedResponse.statusCode} $responseBody');
+      }
+
+      final data = jsonDecode(responseBody);
+      final rawRegions = data['regions'] as List<dynamic>? ?? [];
+      return rawRegions.map((r) {
+        final wb = r['world_bbox'] as List<dynamic>?;
+        return DetectedRegion(
+          type: r['type'] as String,
+          content: r['content'] as String?,
+          worldBbox: wb?.map((v) => (v as num).toDouble()).toList(),
+        );
+      }).toList();
+    } finally {
+      client.close();
+    }
   }
 
   /// Streaming chat. Accepts optional pre-classified regions.
@@ -68,7 +76,10 @@ class ChatService {
     String? sessionId,
     required void Function(String delta) onDelta,
     void Function(String sessionId, String ocrText, List<DetectedRegion> regions)? onMetadata,
+    void Function(Uint8List imageBytes)? onImage,
+    void Function(String error, int round)? onRenderError,
     List<DetectedRegion>? regions,
+    Map<String, dynamic>? annotationContext,
   }) async {
     final settings = SettingsService();
     final url = Uri.parse('${settings.backendUrl}/chat/stream');
@@ -86,6 +97,9 @@ class ChatService {
     }
     if (regions != null) {
       body['regions'] = regions.map((r) => r.toJson()).toList();
+    }
+    if (annotationContext != null) {
+      body['annotation_context'] = annotationContext;
     }
 
     final request = http.Request('POST', url);
@@ -146,6 +160,20 @@ class ChatService {
           case 'delta':
             fullText += data;
             onDelta(data);
+            break;
+          case 'image':
+            if (onImage != null) {
+              onImage(base64Decode(data));
+            }
+            break;
+          case 'render_error':
+            if (onRenderError != null) {
+              final parsed = jsonDecode(data);
+              onRenderError(
+                parsed['error'] as String? ?? 'Unknown error',
+                parsed['round'] as int? ?? 0,
+              );
+            }
             break;
           case 'error':
             client.close();

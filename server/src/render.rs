@@ -145,3 +145,103 @@ fn draw_filled_circle(
         }
     }
 }
+
+/// Render a LaTeX document to PNG bytes via pdflatex + magick.
+pub fn render_latex(content: &str) -> Result<Vec<u8>, String> {
+    use std::process::Command;
+
+    let dir = tempfile::tempdir().map_err(|e| format!("tmpdir: {e}"))?;
+    let tex_path = dir.path().join("input.tex");
+
+    // If content already has \documentclass, use as-is
+    let full_doc = if content.contains("\\documentclass") {
+        content.to_string()
+    } else {
+        // Check if content has a top-level environment (align, equation, tikzpicture, etc.)
+        let has_env = content.contains("\\begin{");
+        // Check if content looks like inline math (has LaTeX commands but no environment)
+        let has_math_cmd = content.contains('\\') && !has_env;
+
+        let body = if has_math_cmd {
+            // Bare math commands — wrap in displaymath
+            format!("$\\displaystyle {}$", content)
+        } else {
+            content.to_string()
+        };
+
+        format!(
+            "\\documentclass[border=10pt]{{standalone}}\n\
+             \\usepackage{{amsmath,amssymb,mathtools,bm}}\n\
+             \\usepackage{{tikz}}\n\
+             \\usetikzlibrary{{positioning,arrows.meta,shapes.geometric,calc,decorations.pathmorphing,fit,backgrounds}}\n\
+             \\usepackage{{pgfplots}}\n\
+             \\pgfplotsset{{compat=1.18}}\n\
+             \\usepackage{{xcolor,enumitem,listings}}\n\
+             \\usepackage{{bussproofs}}\n\
+             \\providecommand{{\\inference}}[2]{{\\frac{{#1}}{{#2}}}}\n\
+             \\begin{{document}}\n{body}\n\\end{{document}}"
+        )
+    };
+
+    std::fs::write(&tex_path, &full_doc).map_err(|e| format!("write tex: {e}"))?;
+
+    let output = Command::new("pdflatex")
+        .args(["-interaction=nonstopmode", "-output-directory"])
+        .arg(dir.path())
+        .arg(&tex_path)
+        .output()
+        .map_err(|e| format!("pdflatex exec: {e}"))?;
+
+    if !output.status.success() {
+        let log = String::from_utf8_lossy(&output.stdout);
+        // Extract the error line from the log
+        let error_lines: Vec<&str> = log.lines().filter(|l| l.starts_with('!') || l.contains("Error")).collect();
+        return Err(format!("pdflatex failed: {}", error_lines.join("; ")));
+    }
+
+    let pdf_path = dir.path().join("input.pdf");
+    let png_path = dir.path().join("output.png");
+
+    let convert = Command::new("magick")
+        .args([
+            "-density", "300",
+            pdf_path.to_str().unwrap(),
+            "-colorspace", "Gray",
+            "-quality", "95",
+            png_path.to_str().unwrap(),
+        ])
+        .output()
+        .map_err(|e| format!("magick exec: {e}"))?;
+
+    if !convert.status.success() {
+        return Err(format!("magick failed: {}", String::from_utf8_lossy(&convert.stderr)));
+    }
+
+    std::fs::read(&png_path).map_err(|e| format!("read png: {e}"))
+}
+
+/// Render SVG content to PNG bytes via rsvg-convert.
+pub fn render_svg(content: &str) -> Result<Vec<u8>, String> {
+    use std::process::Command;
+
+    let dir = tempfile::tempdir().map_err(|e| format!("tmpdir: {e}"))?;
+    let svg_path = dir.path().join("input.svg");
+    let png_path = dir.path().join("output.png");
+
+    std::fs::write(&svg_path, content).map_err(|e| format!("write svg: {e}"))?;
+
+    let output = Command::new("rsvg-convert")
+        .args([
+            svg_path.to_str().unwrap(),
+            "-o",
+            png_path.to_str().unwrap(),
+        ])
+        .output()
+        .map_err(|e| format!("rsvg-convert exec: {e}"))?;
+
+    if !output.status.success() {
+        return Err(format!("rsvg-convert failed: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+
+    std::fs::read(&png_path).map_err(|e| format!("read png: {e}"))
+}

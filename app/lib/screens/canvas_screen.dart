@@ -1,6 +1,8 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math' as math;
-import 'dart:ui' show PointerDeviceKind;
+import 'dart:typed_data';
+import 'dart:ui' show ImmutableBuffer, PointerDeviceKind;
 import 'package:flutter/material.dart';
 import 'package:onyxsdk_pen/onyxsdk_pen.dart';
 import 'package:perfect_freehand/perfect_freehand.dart';
@@ -84,6 +86,16 @@ class _CanvasScreenState extends State<CanvasScreen> {
   Rect? _detectionStrokeBounds;
   List<StrokeObject> _detectionStrokes = [];
   List<CanvasObject> _previewObjects = [];
+
+  // Annotation state: strokes near/on a Claude response
+  bool _isAnnotation = false;
+  CanvasObject? _annotationTarget; // TextObject or DiagramObject being annotated
+  ConversationThread? _annotationThread;
+
+  // Render error feedback
+  String? _renderError;
+  Offset? _renderErrorPos;
+
   double _countdownRemaining = 5.0;
   static const _countdownDuration = 5.0;
   Timer? _countdownTimer;
@@ -139,6 +151,9 @@ class _CanvasScreenState extends State<CanvasScreen> {
       _detectionStrokeBounds = null;
       _detectionStrokes = [];
       _previewObjects = [];
+      _isAnnotation = false;
+      _annotationTarget = null;
+      _annotationThread = null;
       _countdownRemaining = _countdownDuration;
     });
   }
@@ -214,6 +229,179 @@ class _CanvasScreenState extends State<CanvasScreen> {
     } finally {
       setState(() => _isOcrLoading = false);
     }
+  }
+
+  /// Reclassify selected ImageBboxObject(s) as text regions.
+  Future<void> _reclassifyAsText() async {
+    final imageBboxes = _selectedObjects.whereType<ImageBboxObject>().toList();
+    if (imageBboxes.isEmpty) return;
+
+    setState(() => _isOcrLoading = true);
+    try {
+      for (final bbox in imageBboxes) {
+        // Find strokes within this bbox
+        final strokes = _detectionStrokes.where((s) {
+          return s.boundingBox.overlaps(bbox.worldRect);
+        }).toList();
+
+        if (strokes.isEmpty) continue;
+
+        // OCR the strokes
+        final text = await OcrService.recognize(strokes);
+        if (text.isEmpty) continue;
+
+        setState(() {
+          // Update matching DetectedRegion
+          for (final region in _detectedRegions) {
+            if (region.type == 'image' && region.worldBbox != null) {
+              final wb = region.worldBbox!;
+              final regionRect = Rect.fromLTRB(wb[0], wb[1], wb[2], wb[3]);
+              if (regionRect.overlaps(bbox.worldRect)) {
+                region.type = 'text';
+                region.content = text;
+                break;
+              }
+            }
+          }
+          // Swap objects: remove ImageBbox, add OcrAnnotation
+          _objects.remove(bbox);
+          _previewObjects.remove(bbox);
+          final annotation = OcrAnnotationObject(
+            text: text,
+            parentStrokes: List.of(strokes),
+          );
+          _objects.add(annotation);
+          _previewObjects.add(annotation);
+          _clearSelection();
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('OCR error: $e')),
+        );
+      }
+    } finally {
+      setState(() => _isOcrLoading = false);
+    }
+  }
+
+  /// Reclassify selected strokes as an image region (instead of text).
+  void _reclassifyAsImage() {
+    final strokes = _selectedObjects.whereType<StrokeObject>().toList();
+    if (strokes.isEmpty) return;
+
+    // Compute bounding box from selected strokes
+    Rect bounds = strokes.first.boundingBox;
+    for (final s in strokes.skip(1)) {
+      bounds = bounds.expandToInclude(s.boundingBox);
+    }
+
+    setState(() {
+      // Remove text regions that overlap these strokes
+      _detectedRegions.removeWhere((r) => r.type == 'text');
+
+      // Add image region
+      _detectedRegions.add(DetectedRegion(
+        type: 'image',
+        worldBbox: [bounds.left, bounds.top, bounds.right, bounds.bottom],
+      ));
+
+      // Remove associated OcrAnnotations
+      _objects.removeWhere((obj) {
+        if (obj is OcrAnnotationObject) {
+          final isForTheseStrokes = obj.parentStrokes.any((s) => strokes.contains(s));
+          if (isForTheseStrokes) {
+            _previewObjects.remove(obj);
+            return true;
+          }
+        }
+        return false;
+      });
+
+      // Add ImageBboxObject
+      final imageBbox = ImageBboxObject(worldRect: bounds, label: 'image');
+      _objects.add(imageBbox);
+      _previewObjects.add(imageBbox);
+
+      _clearSelection();
+    });
+  }
+
+  /// Merge multiple selected ImageBboxObjects into one.
+  void _mergeImageBboxes(List<ImageBboxObject> bboxes) {
+    if (bboxes.length < 2) return;
+
+    Rect merged = bboxes.first.worldRect;
+    for (final b in bboxes.skip(1)) {
+      merged = merged.expandToInclude(b.worldRect);
+    }
+
+    setState(() {
+      // Remove old bboxes and their detected regions
+      for (final b in bboxes) {
+        _objects.remove(b);
+        _previewObjects.remove(b);
+        _detectedRegions.removeWhere((r) {
+          if (r.type == 'image' && r.worldBbox != null) {
+            final wb = r.worldBbox!;
+            final rRect = Rect.fromLTRB(wb[0], wb[1], wb[2], wb[3]);
+            return rRect.overlaps(b.worldRect);
+          }
+          return false;
+        });
+      }
+
+      // Add merged bbox + region
+      final mergedBbox = ImageBboxObject(worldRect: merged, label: 'image');
+      _objects.add(mergedBbox);
+      _previewObjects.add(mergedBbox);
+      _detectedRegions.add(DetectedRegion(
+        type: 'image',
+        worldBbox: [merged.left, merged.top, merged.right, merged.bottom],
+      ));
+      _clearSelection();
+    });
+  }
+
+  bool get _isInDetectionPhase =>
+      _penFlowState == PenFlowState.countdown ||
+      _penFlowState == PenFlowState.paused ||
+      _penFlowState == PenFlowState.review;
+
+  // --- Annotation detection ---
+
+  /// Find the Claude response object (TextObject or DiagramObject) that these
+  /// strokes are annotating, if any. Returns null if strokes are standalone.
+  CanvasObject? _findAnnotationTarget(Rect strokeBounds) {
+    const margin = 30.0;
+    final expanded = strokeBounds.inflate(margin);
+    CanvasObject? best;
+    double bestOverlap = 0;
+    for (final obj in _objects) {
+      final isResponse = (obj is TextObject && obj.sessionId != null) || obj is DiagramObject;
+      if (!isResponse) continue;
+      if (!expanded.overlaps(obj.boundingBox)) continue;
+      final intersection = expanded.intersect(obj.boundingBox);
+      final overlap = intersection.width * intersection.height;
+      if (overlap > bestOverlap) {
+        bestOverlap = overlap;
+        best = obj;
+      }
+    }
+    return best;
+  }
+
+  /// Find the bottom-most y-coordinate of all objects in a thread's x-range.
+  double _threadBottomY(ConversationThread thread) {
+    double maxBottom = 0;
+    for (final obj in _objects) {
+      final bb = obj.boundingBox;
+      if (bb.right > thread.xMin - 50 && bb.left < thread.xMax + 50) {
+        if (bb.bottom > maxBottom) maxBottom = bb.bottom;
+      }
+    }
+    return maxBottom;
   }
 
   // --- Pen flow: detection → preview → countdown → send ---
@@ -320,9 +508,14 @@ class _CanvasScreenState extends State<CanvasScreen> {
 
     ChatService.detect(allStrokes).then((regions) {
       if (!mounted) return;
-      // If new strokes arrived during detection, re-detect with everything
+      // If new strokes arrived during detection, debounce before re-detecting
       if (_strokeBuffer.isNotEmpty) {
-        _startDetection();
+        _debounceTimer?.cancel();
+        _debounceTimer = Timer(
+          const Duration(milliseconds: _debounceMs),
+          _startDetection,
+        );
+        setState(() => _penFlowState = PenFlowState.debouncing);
         return;
       }
       _showPreview(regions);
@@ -364,10 +557,17 @@ class _CanvasScreenState extends State<CanvasScreen> {
       }
     }
 
+    // Check if strokes annotate an existing response
+    final target = _findAnnotationTarget(bounds);
+    final thread = target != null ? _findThread(bounds.left, bounds.right) : null;
+
     setState(() {
       _detectedRegions = regions;
       _previewObjects = preview;
       _detectionStrokeBounds = bounds;
+      _isAnnotation = target != null;
+      _annotationTarget = target;
+      _annotationThread = thread;
       for (final obj in preview) {
         _objects.add(obj);
       }
@@ -486,9 +686,15 @@ class _CanvasScreenState extends State<CanvasScreen> {
       }
     }
 
+    final target = _findAnnotationTarget(bounds);
+    final thread = target != null ? _findThread(bounds.left, bounds.right) : null;
+
     setState(() {
       _detectedRegions = regions;
       _previewObjects = preview;
+      _isAnnotation = target != null;
+      _annotationTarget = target;
+      _annotationThread = thread;
       for (final obj in preview) {
         _objects.add(obj);
       }
@@ -499,6 +705,12 @@ class _CanvasScreenState extends State<CanvasScreen> {
   void _sendToClaude() {
     if (_detectionStrokes.isEmpty) {
       setState(() => _penFlowState = PenFlowState.idle);
+      return;
+    }
+
+    // If user drew more strokes since detection, re-detect with everything
+    if (_strokeBuffer.isNotEmpty) {
+      _startDetection();
       return;
     }
 
@@ -551,8 +763,14 @@ class _CanvasScreenState extends State<CanvasScreen> {
       return;
     }
 
-    // Add thinking indicator below strokes
-    final thinkingPos = Offset(strokeBounds.left, strokeBounds.bottom + 15);
+    // Add thinking indicator: at thread bottom for annotations, below strokes otherwise
+    final Offset thinkingPos;
+    if (_isAnnotation && _annotationThread != null) {
+      final bottomY = _threadBottomY(thread);
+      thinkingPos = Offset(thread.xMin, bottomY + 15);
+    } else {
+      thinkingPos = Offset(strokeBounds.left, strokeBounds.bottom + 15);
+    }
     final thinking = ThinkingObject(
       position: thinkingPos,
       sessionId: thread.sessionId,
@@ -562,8 +780,13 @@ class _CanvasScreenState extends State<CanvasScreen> {
       thread!.isWaitingForResponse = true;
     });
 
+    // Capture annotation state before clearing
+    final isAnnotation = _isAnnotation;
+    final annotationTarget = _annotationTarget;
+
     _startThinkingAnimation(thinking);
-    _doClaudeChat(strokes, thread, thinking, strokeBounds, regions);
+    _doClaudeChat(strokes, thread, thinking, strokeBounds, regions,
+        isAnnotation: isAnnotation, annotationTarget: annotationTarget);
   }
 
   void _startThinkingAnimation(ThinkingObject thinking) {
@@ -588,23 +811,40 @@ class _CanvasScreenState extends State<CanvasScreen> {
     ConversationThread thread,
     ThinkingObject thinking,
     Rect strokeBounds,
-    List<DetectedRegion> regions,
-  ) async {
+    List<DetectedRegion> regions, {
+    bool isAnnotation = false,
+    CanvasObject? annotationTarget,
+  }) async {
     try {
       final responseY = thinking.position.dy;
       final convLabel = _threadLabels[thread.sessionId];
+      final responseX = isAnnotation ? thread.xMin : strokeBounds.left;
       final responseText = TextObject(
         text: '',
-        position: Offset(strokeBounds.left, responseY),
+        position: Offset(responseX, responseY),
         fontSize: 20,
         conversationLabel: convLabel,
       );
       double lastHeight = 0;
 
+      // Collect diagram images during streaming, place them after text is final
+      final pendingImages = <Uint8List>[];
+
+      // Build annotation context if annotating a response
+      Map<String, dynamic>? annotationCtx;
+      if (isAnnotation && annotationTarget != null) {
+        if (annotationTarget is TextObject) {
+          annotationCtx = {'original_response': annotationTarget.text};
+        } else if (annotationTarget is DiagramObject) {
+          annotationCtx = {'original_image_b64': base64Encode(annotationTarget.imageBytes)};
+        }
+      }
+
       final response = await ChatService.chatStream(
         strokes,
         sessionId: thread.sessionId,
         regions: regions.isNotEmpty ? regions : null,
+        annotationContext: annotationCtx,
         onMetadata: (sessionId, ocrText, metaRegions) {
           if (!mounted) return;
           setState(() {
@@ -656,12 +896,31 @@ class _CanvasScreenState extends State<CanvasScreen> {
             }
           });
         },
+        onImage: (imageBytes) {
+          pendingImages.add(imageBytes);
+          // Clear error indicator — render succeeded
+          if (_renderError != null && mounted) {
+            setState(() {
+              _renderError = null;
+              _renderErrorPos = null;
+            });
+          }
+        },
+        onRenderError: (error, round) {
+          if (!mounted) return;
+          setState(() {
+            _renderError = error;
+            _renderErrorPos = Offset(responseX, responseText.boundingBox.bottom + 10);
+          });
+        },
       );
 
       if (!mounted) return;
 
       DebugService.trace('claude_response', {'ocr': response.ocrText, 'response_len': response.text.length, 'session': response.sessionId});
       setState(() {
+        _renderError = null;
+        _renderErrorPos = null;
         if (_objects.contains(thinking)) {
           _objects.remove(thinking);
           _objects.add(responseText);
@@ -672,6 +931,18 @@ class _CanvasScreenState extends State<CanvasScreen> {
         thread.sessionId = response.sessionId;
         _penFlowState = PenFlowState.idle;
       });
+
+      // Place diagram images below the finalized response text
+      for (final imageBytes in pendingImages) {
+        final diagramY = responseText.boundingBox.bottom + 10;
+        final diagram = DiagramObject(
+          position: Offset(responseX, diagramY),
+          imageBytes: imageBytes,
+        );
+        setState(() => _objects.add(diagram));
+        await _decodeDiagramSize(diagram);
+      }
+
       // Re-send any strokes that were queued while waiting
       if (_strokeBuffer.isNotEmpty) {
         _debounceTimer?.cancel();
@@ -700,6 +971,33 @@ class _CanvasScreenState extends State<CanvasScreen> {
           setState(() => _penFlowState = PenFlowState.debouncing);
         }
       }
+    }
+  }
+
+  /// Decode a diagram's PNG bytes to get its dimensions, then update layout.
+  Future<void> _decodeDiagramSize(DiagramObject diagram) async {
+    final codec = await PaintingBinding.instance.instantiateImageCodecWithSize(
+      await ImmutableBuffer.fromUint8List(diagram.imageBytes),
+    );
+    final frame = await codec.getNextFrame();
+    final img = frame.image;
+    // Scale to fit within a reasonable width on canvas
+    const maxWidth = 500.0;
+    final aspect = img.width / img.height;
+    final w = img.width > maxWidth ? maxWidth : img.width.toDouble();
+    final h = w / aspect;
+    if (mounted) {
+      setState(() {
+        diagram.width = w;
+        diagram.height = h;
+        // Push objects below the diagram down
+        for (final obj in _objects) {
+          if (obj == diagram) continue;
+          if (obj.boundingBox.top > diagram.position.dy - 5) {
+            obj.translate(Offset(0, h + 15));
+          }
+        }
+      });
     }
   }
 
@@ -1155,6 +1453,11 @@ class _CanvasScreenState extends State<CanvasScreen> {
           // Review prompt
           if (_penFlowState == PenFlowState.review && _detectionStrokeBounds != null)
             _buildReviewPrompt(),
+          // Diagram image overlays
+          ..._buildDiagramOverlays(),
+          // Render error indicator
+          if (_renderError != null && _renderErrorPos != null)
+            _buildRenderErrorIndicator(),
         ],
       ),
     );
@@ -1162,7 +1465,14 @@ class _CanvasScreenState extends State<CanvasScreen> {
 
   Widget _buildCountdownBar() {
     final bounds = _detectionStrokeBounds!;
-    final screenPos = _worldToScreen(Offset(bounds.left, bounds.bottom + 8));
+    final Offset worldPos;
+    if (_isAnnotation && _annotationThread != null) {
+      final bottomY = _threadBottomY(_annotationThread!);
+      worldPos = Offset(_annotationThread!.xMin, bottomY + 8);
+    } else {
+      worldPos = Offset(bounds.left, bounds.bottom + 8);
+    }
+    final screenPos = _worldToScreen(worldPos);
     final screenWidth = bounds.width * _scale;
     final barWidth = screenWidth.clamp(160.0, 320.0);
     final fraction = _countdownRemaining / _countdownDuration;
@@ -1185,9 +1495,9 @@ class _CanvasScreenState extends State<CanvasScreen> {
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  const Text(
-                    'sending to claude',
-                    style: TextStyle(
+                  Text(
+                    _isAnnotation ? 'annotating response' : 'sending to claude',
+                    style: const TextStyle(
                       fontFamily: 'serif',
                       fontSize: 14,
                       fontStyle: FontStyle.italic,
@@ -1228,7 +1538,14 @@ class _CanvasScreenState extends State<CanvasScreen> {
 
   Widget _buildReviewPrompt() {
     final bounds = _detectionStrokeBounds!;
-    final screenPos = _worldToScreen(Offset(bounds.left, bounds.bottom + 8));
+    final Offset worldPos;
+    if (_isAnnotation && _annotationThread != null) {
+      final bottomY = _threadBottomY(_annotationThread!);
+      worldPos = Offset(_annotationThread!.xMin, bottomY + 8);
+    } else {
+      worldPos = Offset(bounds.left, bounds.bottom + 8);
+    }
+    final screenPos = _worldToScreen(worldPos);
     final screenWidth = bounds.width * _scale;
     final barWidth = screenWidth.clamp(160.0, 320.0);
 
@@ -1247,9 +1564,9 @@ class _CanvasScreenState extends State<CanvasScreen> {
           child: Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              const Text(
-                'send to claude?',
-                style: TextStyle(
+              Text(
+                _isAnnotation ? 'send annotation?' : 'send to claude?',
+                style: const TextStyle(
                   fontFamily: 'serif',
                   fontSize: 14,
                   fontStyle: FontStyle.italic,
@@ -1273,9 +1590,79 @@ class _CanvasScreenState extends State<CanvasScreen> {
     );
   }
 
+  /// Build Image.memory overlays for DiagramObjects on the canvas.
+  Widget _buildRenderErrorIndicator() {
+    final screenPos = _worldToScreen(_renderErrorPos!);
+    final snippet = _renderError!.length > 80 ? '${_renderError!.substring(0, 80)}...' : _renderError!;
+    return Positioned(
+      left: screenPos.dx,
+      top: screenPos.dy,
+      child: Container(
+        width: 340,
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          border: Border.all(color: const Color(0xFF1A1A1A), width: 0.5),
+          borderRadius: BorderRadius.circular(2),
+        ),
+        child: Row(
+          children: [
+            const SizedBox(
+              width: 14, height: 14,
+              child: CircularProgressIndicator(
+                strokeWidth: 1.5,
+                color: Color(0xFF4A4A4A),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                'retrying render... $snippet',
+                style: const TextStyle(
+                  fontFamily: 'serif',
+                  fontSize: 12,
+                  fontStyle: FontStyle.italic,
+                  color: Color(0xFF666666),
+                ),
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  List<Widget> _buildDiagramOverlays() {
+    final diagrams = _objects.whereType<DiagramObject>().where((d) => d.width > 0);
+    return diagrams.map((d) {
+      final screenPos = _worldToScreen(d.position);
+      return Positioned(
+        left: screenPos.dx,
+        top: screenPos.dy,
+        child: IgnorePointer(
+          child: Transform.scale(
+            scale: _scale,
+            alignment: Alignment.topLeft,
+            child: Image.memory(
+              d.imageBytes,
+              width: d.width,
+              height: d.height,
+              filterQuality: FilterQuality.high,
+            ),
+          ),
+        ),
+      );
+    }).toList();
+  }
+
   Widget _buildContextMenu() {
     final bounds = _selectionBoundingBox!;
     final bottomCenter = _worldToScreen(bounds.bottomCenter);
+
+    final hasImageBbox = _selectedObjects.whereType<ImageBboxObject>().isNotEmpty;
+    final hasStrokes = _selectedObjects.whereType<StrokeObject>().isNotEmpty;
 
     final actions = <Widget>[
       _ContextAction(
@@ -1305,6 +1692,33 @@ class _CanvasScreenState extends State<CanvasScreen> {
         },
       ),
     ];
+
+    // Reclassify options during detection phase
+    if (_isInDetectionPhase) {
+      final imageBboxes = _selectedObjects.whereType<ImageBboxObject>().toList();
+      if (imageBboxes.length > 1) {
+        actions.insert(1, _ContextAction(
+          icon: Icons.join_full,
+          label: 'Merge',
+          onTap: () => _mergeImageBboxes(imageBboxes),
+        ));
+      }
+      if (hasImageBbox) {
+        actions.insert(1, _ContextAction(
+          icon: Icons.text_fields,
+          label: '→ Text',
+          loading: _isOcrLoading,
+          onTap: _isOcrLoading ? null : _reclassifyAsText,
+        ));
+      }
+      if (hasStrokes) {
+        actions.insert(hasImageBbox ? 2 : 1, _ContextAction(
+          icon: Icons.image_outlined,
+          label: '→ Image',
+          onTap: _reclassifyAsImage,
+        ));
+      }
+    }
 
     if (_penFlowState == PenFlowState.review) {
       actions.add(_ContextAction(
@@ -1470,6 +1884,8 @@ class _CanvasPainter extends CustomPainter {
         _drawStroke(canvas, obj, strokePaint);
       } else if (obj is TextObject) {
         _drawText(canvas, obj);
+      } else if (obj is DiagramObject) {
+        _drawDiagram(canvas, obj);
       } else if (obj is ThinkingObject) {
         _drawThinking(canvas, obj);
       } else if (obj is OcrAnnotationObject) {
@@ -1617,6 +2033,16 @@ class _CanvasPainter extends CustomPainter {
       )..layout();
       tp.paint(canvas, Offset(obj.worldRect.left + 3, obj.worldRect.top - tp.height - 2));
     }
+  }
+
+  void _drawDiagram(Canvas canvas, DiagramObject obj) {
+    if (obj.width == 0 || obj.height == 0) return;
+    // Lightweight border — actual image rendered via widget overlay
+    final borderPaint = Paint()
+      ..color = const Color(0xFFDDDDDD)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 0.5 / scale;
+    canvas.drawRect(obj.boundingBox, borderPaint);
   }
 
   void _drawThinking(Canvas canvas, ThinkingObject obj) {

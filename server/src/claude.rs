@@ -57,6 +57,8 @@ pub enum ContentPart {
     ImageBase64 { media_type: String, data: String },
 }
 
+pub const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
+
 #[derive(Deserialize)]
 struct ClaudeResponse {
     content: Vec<ContentBlock>,
@@ -67,19 +69,7 @@ struct ContentBlock {
     text: Option<String>,
 }
 
-pub const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
-
-/// Chat with plain text messages (existing sessions).
-pub async fn chat(
-    api_key: &str,
-    messages: &[ClaudeMessage],
-    model: &str,
-) -> Result<String, String> {
-    let raw: Vec<ClaudeRawMessage> = messages.iter().map(|m| m.to_raw()).collect();
-    send_request(api_key, &raw, model).await
-}
-
-/// Chat with a mixed-content final message (text + images) appended to history.
+/// Chat with a mixed-content message (text + images) appended to history (non-streaming).
 pub async fn chat_mixed(
     api_key: &str,
     history: &[ClaudeMessage],
@@ -88,20 +78,12 @@ pub async fn chat_mixed(
 ) -> Result<String, String> {
     let mut raw: Vec<ClaudeRawMessage> = history.iter().map(|m| m.to_raw()).collect();
     raw.push(new_message);
-    send_request(api_key, &raw, model).await
-}
 
-async fn send_request(
-    api_key: &str,
-    messages: &[ClaudeRawMessage],
-    model: &str,
-) -> Result<String, String> {
     let client = Client::new();
-
     let req = ClaudeRequest {
         model: model.to_string(),
-        max_tokens: 1024,
-        messages: messages.to_vec(),
+        max_tokens: 4096,
+        messages: raw,
     };
 
     let resp = client
@@ -132,32 +114,52 @@ async fn send_request(
         .join(""))
 }
 
+// --- Tool use support ---
+
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub input: serde_json::Value,
+}
+
+/// Result of a single streaming call — text + any tool calls.
+pub struct StreamResult {
+    pub text: String,
+    pub tool_calls: Vec<ToolCall>,
+    /// Full assistant content blocks (text + tool_use) for building continuation messages.
+    pub assistant_blocks: Vec<serde_json::Value>,
+}
+
 #[derive(Serialize)]
 struct ClaudeStreamRequest {
     model: String,
     max_tokens: u32,
     stream: bool,
     messages: Vec<ClaudeRawMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<serde_json::Value>>,
 }
 
-/// Stream a Claude response, sending text deltas through the channel.
-/// Returns the full accumulated text when done.
-pub async fn chat_mixed_stream(
+/// Stream a single Claude request. Returns accumulated text + tool calls.
+/// Text deltas are sent through `tx` for real-time streaming.
+pub async fn stream_request(
     api_key: &str,
-    history: &[ClaudeMessage],
-    new_message: ClaudeRawMessage,
+    messages: Vec<ClaudeRawMessage>,
     model: &str,
-    tx: mpsc::Sender<String>,
-) -> Result<String, String> {
-    let mut raw: Vec<ClaudeRawMessage> = history.iter().map(|m| m.to_raw()).collect();
-    raw.push(new_message);
-
+    system: Option<&str>,
+    tools: Option<&[serde_json::Value]>,
+    tx: &mpsc::Sender<String>,
+) -> Result<StreamResult, String> {
     let client = Client::new();
     let req = ClaudeStreamRequest {
         model: model.to_string(),
-        max_tokens: 1024,
+        max_tokens: 4096,
         stream: true,
-        messages: raw,
+        messages,
+        system: system.map(|s| s.to_string()),
+        tools: tools.map(|t| t.to_vec()),
     };
 
     let resp = client
@@ -177,43 +179,98 @@ pub async fn chat_mixed_stream(
     }
 
     let mut full_text = String::new();
+    let mut tool_calls = Vec::new();
+    let mut assistant_blocks = Vec::new();
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
+
+    // Tool use accumulation state
+    let mut current_tool_id = String::new();
+    let mut current_tool_name = String::new();
+    let mut current_tool_input = String::new();
+    let mut in_tool_use = false;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("Stream read error: {e}"))?;
         buf.push_str(&String::from_utf8_lossy(&chunk));
 
-        // Process complete SSE lines from buffer
         while let Some(pos) = buf.find("\n\n") {
             let event_block = buf[..pos].to_string();
             buf = buf[pos + 2..].to_string();
 
-            // Parse SSE event
-            let mut event_type = "";
+            let mut event_type = String::new();
             let mut data_str = String::new();
             for line in event_block.lines() {
                 if let Some(et) = line.strip_prefix("event: ") {
-                    event_type = match et.trim() {
-                        "content_block_delta" => "content_block_delta",
-                        "message_stop" => "message_stop",
-                        _ => "",
-                    };
+                    event_type = et.trim().to_string();
                 } else if let Some(d) = line.strip_prefix("data: ") {
                     data_str = d.to_string();
                 }
             }
 
-            if event_type == "content_block_delta" && !data_str.is_empty() {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data_str) {
-                    if let Some(text) = v["delta"]["text"].as_str() {
+            if data_str.is_empty() {
+                continue;
+            }
+
+            let v: serde_json::Value = match serde_json::from_str(&data_str) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            match event_type.as_str() {
+                "content_block_start" => {
+                    let block = &v["content_block"];
+                    if block["type"].as_str() == Some("tool_use") {
+                        in_tool_use = true;
+                        current_tool_id = block["id"].as_str().unwrap_or("").to_string();
+                        current_tool_name = block["name"].as_str().unwrap_or("").to_string();
+                        current_tool_input.clear();
+                    }
+                }
+                "content_block_delta" => {
+                    if in_tool_use {
+                        if let Some(json_frag) = v["delta"]["partial_json"].as_str() {
+                            current_tool_input.push_str(json_frag);
+                        }
+                    } else if let Some(text) = v["delta"]["text"].as_str() {
                         full_text.push_str(text);
                         let _ = tx.send(text.to_string()).await;
                     }
                 }
+                "content_block_stop" => {
+                    if in_tool_use {
+                        let input: serde_json::Value =
+                            serde_json::from_str(&current_tool_input).unwrap_or_default();
+                        assistant_blocks.push(serde_json::json!({
+                            "type": "tool_use",
+                            "id": &current_tool_id,
+                            "name": &current_tool_name,
+                            "input": &input,
+                        }));
+                        tool_calls.push(ToolCall {
+                            id: current_tool_id.clone(),
+                            name: current_tool_name.clone(),
+                            input,
+                        });
+                        in_tool_use = false;
+                    }
+                }
+                _ => {}
             }
         }
     }
 
-    Ok(full_text)
+    // Add text block if we accumulated any
+    if !full_text.is_empty() {
+        assistant_blocks.insert(0, serde_json::json!({
+            "type": "text",
+            "text": &full_text,
+        }));
+    }
+
+    Ok(StreamResult {
+        text: full_text,
+        tool_calls,
+        assistant_blocks,
+    })
 }
